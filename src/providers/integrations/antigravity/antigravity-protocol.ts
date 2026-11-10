@@ -96,6 +96,9 @@ export function getAntigravityModelWireProfile(
  */
 export function antigravityWireModelId(modelId: string): string {
   if (modelId === "claude-opus-4-6") return "claude-opus-4-6-thinking";
+  // The live catalog collapses Argon's tiered wire ids to one logical model;
+  // Cloud Code Assist rejects the bare logical id, so use its balanced tier.
+  if (modelId === "gemini-4-argon") return "gemini-4-argon-medium";
   if (modelId === "gemini-3.1-pro" || modelId === "gemini-3.1-pro-high") {
     return "gemini-pro-agent";
   }
