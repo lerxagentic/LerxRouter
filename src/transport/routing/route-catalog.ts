@@ -14,6 +14,7 @@ import {
   tenantDisabledModels,
   cliToolMappings,
   cliToolSettings,
+  consoleSettings,
 } from "../../persistence/schema";
 import "../../providers/integrations/claude/claude-oauth";
 import "../../providers/integrations/codex/codex-oauth";
@@ -30,6 +31,7 @@ import {
 import { DEFAULT_PROXY_BYPASS_PROVIDER_IDS, isBundledProviderId } from "../../providers/provider-registry";
 import type { ServiceKind, WireFamily } from "../canonical-model";
 import { providerHasAdapterUserAgent, providerUsesBespokeWire } from "../../providers/provider-metadata";
+import { resolveUsageFloor } from "./usage-floor";
 
 const CLAUDE_MODEL_FAMILIES = new Set(["opus", "sonnet", "haiku", "fable", "mythos"]);
 
@@ -72,6 +74,8 @@ export function cliMappingSourceKeys(toolId: string, sourceModel: string): reado
 type RouteCandidateWithHealth = RouteCandidate & {
   health_status?: "cooldown" | "model_cooldown" | "credit_floor_reached" | "disabled";
   cooldown_kind?: "hard" | "soft";
+  /** Epoch-ms recovery instant for a timed cooldown, when the upstream stated one. */
+  cooldown_until?: number;
 };
 
 const HARD_COOLDOWN_CATEGORIES: Readonly<Record<string, true>> = {
@@ -139,14 +143,18 @@ export function buildCapabilityProfile(row: {
   };
 }
 
-/** Resolves route identity only for bundled adapters without a native User-Agent builder. */
+/** Resolves route identity: bundled adapters without a native User-Agent builder, plus custom providers. */
 export function resolveRouteUserAgent(
   providerId: string,
   tenantUserAgent: string | undefined,
   globalUserAgent: string | undefined,
 ): string | undefined {
-  if (!isBundledProviderId(providerId) || providerHasAdapterUserAgent(providerId)) return undefined;
-  return resolveTenantOverride(tenantUserAgent, globalUserAgent, DEFAULT_PROVIDER_USER_AGENT);
+  if (isBundledProviderId(providerId)) {
+    if (providerHasAdapterUserAgent(providerId)) return undefined;
+    return resolveTenantOverride(tenantUserAgent, globalUserAgent, DEFAULT_PROVIDER_USER_AGENT);
+  }
+  const selected = resolveTenantOverride(tenantUserAgent, globalUserAgent, undefined);
+  return selected === undefined ? undefined : selected.trim();
 }
 
 /** One persisted model row ready for candidate construction. */
@@ -161,6 +169,7 @@ interface MergedModelRow {
   toolCall: boolean;
   webSearch: boolean;
   enabled: boolean;
+  proOnly?: boolean | null;
 }
 
 /**
@@ -183,6 +192,7 @@ function mergeModelCatalog(
       toolCall: row.toolCall,
       webSearch: row.webSearch,
       enabled: row.enabled,
+      proOnly: row.proOnly,
     }));
 }
 
@@ -220,6 +230,7 @@ const MODEL_COLUMNS = {
   toolCall: models.toolCall,
   webSearch: models.webSearch,
   enabled: models.enabled,
+  proOnly: models.proOnly,
 } as const;
 
 const ACCOUNT_COLUMNS = {
@@ -232,6 +243,7 @@ const ACCOUNT_COLUMNS = {
   modelCooldowns: providerAccounts.modelCooldowns,
   lastErrorCategory: providerAccounts.lastErrorCategory,
   lastRemainingCredit: providerAccounts.lastRemainingCredit,
+  quotaPlan: providerAccounts.quotaPlan,
 } as const;
 
 const ALIAS_COLUMNS = {
@@ -255,6 +267,8 @@ const ROUTING_COLUMNS = {
   maxInflight: providerRoutingSettings.maxInflight,
   creditLimitEnabled: providerRoutingSettings.creditLimitEnabled,
   creditLimit: providerRoutingSettings.creditLimit,
+  usageFloor: providerRoutingSettings.usageFloor,
+  usageFloorUnit: providerRoutingSettings.usageFloorUnit,
   enabled: providerRoutingSettings.enabled,
   bypassProxy: providerRoutingSettings.bypassProxy,
   assignedPoolId: providerRoutingSettings.assignedPoolId,
@@ -311,7 +325,7 @@ class RouteCatalogRepository {
   constructor(private readonly db: CartethyiaDatabase) {}
 
   async loadRouteCatalogSnapshot(tenantId?: string): Promise<RouteCatalogSnapshotResult> {
-    const [providerRows, modelRows, accountRows, aliasRows, comboRows, routingRows, poolRows, disabledModelRows, cliMappingRows, cliMappingSettingRows, poolSettingRows] =
+    const [providerRows, modelRows, accountRows, aliasRows, comboRows, routingRows, poolRows, disabledModelRows, cliMappingRows, cliMappingSettingRows, poolSettingRows, settingsRows] =
       await Promise.all([
         this.db.select(PROVIDER_COLUMNS).from(providers).where(eq(providers.enabled, true)),
         this.db.select(MODEL_COLUMNS).from(models),
@@ -328,7 +342,11 @@ class RouteCatalogRepository {
         this.db.select(CLI_MAPPING_COLUMNS).from(cliToolMappings),
         this.db.select(CLI_MAPPING_SETTING_COLUMNS).from(cliToolSettings),
         this.db.select(POOL_SETTING_COLUMNS).from(poolRoutingSettings),
+        this.db.select({ tenantId: consoleSettings.tenantId, preferences: consoleSettings.preferences }).from(consoleSettings),
       ]);
+    const invokeDisabledTenants = new Set(
+      settingsRows.filter((row) => row.preferences?.invokeDisabled === true).map((row) => row.tenantId),
+    );
     const mergedModelRows = mergeModelCatalog(modelRows);
 
     // Compile tenant-scoped disables into a lookup keyed by the same
@@ -386,6 +404,8 @@ class RouteCatalogRepository {
         maxInflight: row.maxInflight,
         creditLimitEnabled: row.creditLimitEnabled,
         creditLimit: row.creditLimit,
+        usageFloor: row.usageFloor,
+        usageFloorUnit: row.usageFloorUnit === "credit" ? "credit" : "percent",
         enabled: row.enabled,
         bypassProxy: row.bypassProxy,
         assignedPoolId: row.assignedPoolId,
@@ -591,12 +611,27 @@ class RouteCatalogRepository {
           ...(routeUserAgent === undefined ? {} : { user_agent: routeUserAgent }),
           tenant_id: rowTenantId,
           provider_account_id: account.id,
+          ...(model.proOnly === true ? { pro_only: true } : {}),
+          ...(account.quotaPlan === null || account.quotaPlan === undefined
+            ? {}
+            : { account_plan: account.quotaPlan }),
           ...(() => {
             const credit = resolveCreditProtection(model.providerId, rowTenantId);
             return {
               credit_limit_enabled: credit.enabled,
               credit_limit: credit.limit,
             };
+          })(),
+          ...(() => {
+            // The usage floor is read per candidate so the routing decision and
+            // the console panel that configures it can never disagree.
+            const floor = resolveUsageFloor(
+              rowTenantId ? providerRouting[rowTenantId]?.[model.providerId] : undefined,
+              providerRouting.__global__?.[model.providerId],
+            );
+            return floor === undefined
+              ? {}
+              : { usage_floor: floor.floor as number, usage_floor_unit: floor.unit };
           })(),
           ...(typeof account.lastRemainingCredit === "string"
             ? { last_remaining_credit: Number(account.lastRemainingCredit) }
@@ -628,6 +663,10 @@ class RouteCatalogRepository {
             candidate.cooldown_kind = hardCooldownCategory(account.lastErrorCategory)
               ? "hard"
               : "soft";
+            // Carry the deadline so `plan()` can quote a real `retry-after`
+            // instead of the one-second floor a bare 429 falls back to. Only set
+            // when it is still in the future, matching the guard above.
+            candidate.cooldown_until = account.cooldownUntil.getTime();
           }
         }
 
@@ -707,6 +746,7 @@ class RouteCatalogRepository {
       combos,
       ...(routingMap ? { providerRouting: routingMap } : {}),
       ...(Object.keys(poolRouting).length > 0 ? { poolRouting } : {}),
+      ...(invokeDisabledTenants.size > 0 ? { invokeDisabledTenants } : {}),
     };
   }
 }

@@ -42,15 +42,15 @@ import {
  */
 function compressedApp() {
   return new Elysia()
-    .get("/big", () => ({
+    .get("/console/api/big", () => ({
       rows: Array.from({ length: 500 }, (_, index) => ({
         id: index,
         model: "claude-sonnet-4-6",
         status: "completed",
       })),
     }))
-    .get("/small", () => ({ ok: true }))
-    .get("/stream", () => {
+    .get("/console/api/small", () => ({ ok: true }))
+    .get("/console/api/stream", () => {
       const body = "event: tick\ndata: {}\n\n".repeat(400);
       return new Response(body, { headers: { "content-type": "text/event-stream" } });
     })
@@ -64,7 +64,7 @@ function compressedApp() {
 
 /** A request that offers gzip. */
 function gzipRequest(path: string): Request {
-  return new Request(`http://x${path}`, { headers: { "accept-encoding": "gzip" } });
+  return new Request(`http://x/console/api${path}`, { headers: { "accept-encoding": "gzip" } });
 }
 
 describe("acceptsGzip", () => {
@@ -168,7 +168,7 @@ describe("gzipResponse end to end", () => {
   test("the compressed body is dramatically smaller", async () => {
     const app = compressedApp();
     const gzipped = await app.handle(gzipRequest("/big"));
-    const raw = await app.handle(new Request("http://x/big"));
+    const raw = await app.handle(new Request("http://x/console/api/big"));
 
     const gzippedBytes = (await gzipped.arrayBuffer()).byteLength;
     const rawBytes = (await raw.arrayBuffer()).byteLength;
@@ -193,7 +193,7 @@ describe("gzipResponse end to end", () => {
 
   test("a client that did not offer gzip gets the plain body", async () => {
     const app = compressedApp();
-    const response = await app.handle(new Request("http://x/big"));
+    const response = await app.handle(new Request("http://x/console/api/big"));
     expect(response.headers.get("content-encoding")).toBeNull();
     const bytes = (await response.arrayBuffer()).byteLength;
     expect(bytes).toBeGreaterThan(10_000);
@@ -202,7 +202,7 @@ describe("gzipResponse end to end", () => {
   test("a client that refused gzip with q=0 gets the plain body", async () => {
     const app = compressedApp();
     const response = await app.handle(
-      new Request("http://x/big", { headers: { "accept-encoding": "gzip;q=0" } }),
+      new Request("http://x/console/api/big", { headers: { "accept-encoding": "gzip;q=0" } }),
     );
     expect(response.headers.get("content-encoding")).toBeNull();
     expect((await response.arrayBuffer()).byteLength).toBeGreaterThan(10_000);

@@ -79,20 +79,23 @@ describe("the route table", () => {
     }
   });
 
-  test("the documented surface routes that dispatch are NOT proxy dispatch routes", () => {
-    // `/v1/models` is an authenticated gateway route but never dispatches, so it
-    // must not be reported as a proxy request lifecycle event or enqueue a
-    // telemetry row — a row for it would inflate the Usage page with requests no
-    // provider saw.
-    for (const path of ["/v1/models", "/v1/models/claude-sonnet-4-6", "/v1/embeddings", "/v1/images/generations", "/v1/audio/speech"]) {
+  test("surface routes without handlers are not dispatch routes", () => {
+    // Model discovery is authenticated but never dispatches; embeddings and
+    // audio are not mounted. Image generation is a real native dispatch route.
+    for (const path of [
+      "/v1/models",
+      "/v1/models/claude-sonnet-4-6",
+      "/v1/embeddings",
+      "/v1/audio/speech",
+    ]) {
       expect(isProxyDispatchRoute(path)).toBe(false);
     }
+    expect(isProxyDispatchRoute("/v1/images/generations")).toBe(true);
   });
 
-  test("the three removed entries are genuinely absent", () => {
-    // The comment names them specifically: they advertised a surface that 404s.
-    // Asserted so re-adding one is a deliberate act.
-    for (const path of ["/v1/embeddings", "/v1/images/generations", "/v1/audio/speech"]) {
+  test("only mounted native service routes are advertised", () => {
+    expect(isJsonProxyRoutePath("/v1/images/generations")).toBe(true);
+    for (const path of ["/v1/embeddings", "/v1/audio/speech"]) {
       expect(isJsonProxyRoutePath(path)).toBe(false);
     }
   });

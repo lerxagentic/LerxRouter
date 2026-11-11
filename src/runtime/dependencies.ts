@@ -33,6 +33,7 @@ import {
   RedisModelAbuseStore,
 } from "../security/model-abuse";
 import { checkReadiness, resolveRedisMode } from "../persistence/readiness";
+import { subscribePeerSettingsRevisions } from "../persistence/settings-revision";
 import { ProxyRequestPreparer } from "../transport/request/preparer";
 import { DrizzleNetworkPoolLoader } from "../network/pool/loader";
 import {
@@ -40,11 +41,13 @@ import {
   ValidatedNetworkBindingFactory,
 } from "../network/pool/resolver";
 import { NetworkPoolSelector } from "../network/pool/selector";
+import { restorePoolProbeVerdicts, restoreProviderCooldownMarkers } from "../network/pool-cooldown-store";
 import { ScheduledTaskRegistry } from "../workers/tasks";
 import { quotaRefreshSweep } from "../workers/quota-refresh-worker";
 import { checkinEgressForPass } from "../workers/checkin-egress";
 import { createAccountSecretResolver } from "../providers/operations/provider-credential-service";
-import { quotaCacheSize } from "../console/quota/cache";
+import { createQuotaEgressFetcher } from "../console/quota/account-test-egress";
+import { quotaCacheSize, getCachedQuotaEntry, quotaLens } from "../console/quota/cache";
 import { preferencesReaderFor } from "../transport/dispatch/attempt-finalize";
 import { sweepExpiredCooldowns } from "../providers/operations/account-health-service";
 import { DrizzleTelemetryStore } from "../persistence/telemetry-store";
@@ -100,6 +103,7 @@ export interface ProductionDeps {
   admissionService: ApiKeyAdmissionService;
   /** Graduated strikes for repeated invalid-model requests. */
   modelStrikes: ModelStrikeService;
+  runtimeMetricsSampler: RuntimeMetricsSampler;
 }
 
 /**
@@ -137,8 +141,15 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   const snapshotService = new InMemoryRouteSnapshotService(
     createDatabaseSnapshotBuilder(db),
   );
+  subscribePeerSettingsRevisions();
   const routingEngine = new RoutingEngine(
     redis ? new RedisAdmissionController(redis) : undefined,
+    // The usage floor reads the same cached quota windows the console renders,
+    // so the routing decision and the panel that configures the floor agree.
+    redis
+      ? async (accountId, tenantId) =>
+          (await getCachedQuotaEntry(quotaLens(tenantId), accountId, redis))?.quota.windows
+      : undefined,
   );
   const readRoutingAccountInflight = async (
     providerId: string,
@@ -259,6 +270,17 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   });
   const telemetryBuffer = new TelemetryBatchBuffer(db);
   const poolSelector = new NetworkPoolSelector(redis);
+  try {
+    const restored = await restoreProviderCooldownMarkers(poolSelector, db);
+    const replayed = await restorePoolProbeVerdicts(poolSelector, db);
+    if (restored > 0 || replayed > 0) {
+      log.info("[pool-selector] restored provider cooldown state", { mirrored: restored, probeVerdictsApplied: replayed });
+    }
+  } catch (error) {
+    log.warn("[pool-selector] failed to restore provider cooldown state from database", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
   const poolAgentResolver = new PoolAgentResolver(
     new DrizzleNetworkPoolLoader(db),
     { ssrfPolicy, db },
@@ -336,6 +358,11 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
       resolveRefresher: (providerId) => registry.resolveRefresher(providerId),
       refreshService: oauthRefreshService,
     });
+    const quotaEgress = createQuotaEgressFetcher({
+      db,
+      poolSelector,
+      networkBindingFactory,
+    });
     // Keeps every account's cached quota warm so opening the Quota page is a
     // cache read. Without this the only refreshes are user-triggered, so the
     // first open after an expiry always blocks on the provider. The quota cache
@@ -360,6 +387,11 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
           // it changes, so the next plan sees the fresh figure and the request
           // path can enforce per-account floors from the last cached balance.
           snapshotInvalidator: snapshotService,
+          // Quota is an upstream WorkBuddy/CodeBuddy billing request too. It
+          // must use the tenant pool; direct VPS egress is rate-limited by the
+          // upstream and previously left the quota cache empty.
+          quotaFetcherFor: (accountId, tenantId, providerId) =>
+            quotaEgress(accountId, tenantId, providerId),
           // The check-in ride-along rotates egress per account: each account
           // gets the next active pool in its tenant's rotation so check-ins
           // spread across IPs instead of sharing one direct egress. No pool
@@ -398,6 +430,7 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     modelStrikes,
     readiness,
     scheduledTasks,
+    runtimeMetricsSampler,
     poolAgentResolver,
     telemetryBuffer,
     poolSelector,

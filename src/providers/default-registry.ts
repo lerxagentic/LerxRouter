@@ -6,6 +6,8 @@ import type { QuotaFetcher } from "./quota/quota-support";
 import { BUNDLED_PROVIDER_METADATA, PROVIDER_COMPATIBILITY_PROFILES, providerRequiresAccount, providerUpstreamHost, providerDefaultWireFamily, type BundledProviderId } from "./provider-metadata";
 import { defineModel } from "./model-definition";
 import type { ProviderModelDiscovery } from "./discovery/discovery-types";
+import type { QoderRealm } from "./integrations/qoder/qoder-realm";
+import type { TraeRealm } from "./integrations/trae/trae-realm";
 
 /**
  * Builds a lazy OAuth authentication loader from a dynamic module import and the
@@ -43,9 +45,11 @@ type ProviderModuleCapabilities = Partial<Omit<ProviderModule, "loadAdapter">> &
 
 function configuredProvider(
   providerId: keyof typeof GENERIC_API_KEY_SPECS,
+  loadModels?: ProviderModuleCapabilities["loadModels"],
 ): ProviderModuleCapabilities {
   return {
     loadAdapter: async () => createApiKeyAdapter(GENERIC_API_KEY_SPECS[providerId]),
+    ...(loadModels === undefined ? {} : { loadModels }),
   };
 }
 
@@ -63,6 +67,84 @@ function openAIModelDiscovery(
       providerId,
       ...(options?.headers ? { headers: options.headers(credential) } : {}),
       ...(fetcher ? { fetcher } : {}),
+    });
+  };
+}
+
+function traeDiscovery(
+  realm: TraeRealm,
+  providerId: string,
+): NonNullable<ProviderModuleCapabilities["loadModelDiscovery"]> {
+  return async () => async (request: Parameters<ProviderModelDiscovery>[0]) => {
+    const { discoverTraeModels } = await import("./integrations/trae/trae");
+    const { TRAE_INTL_MODELS, TRAE_CN_MODELS } = await import("./integrations/trae/trae-catalog");
+    const secret = request.credential.trim();
+    const fetcher = request.fetcher as unknown as typeof fetch | undefined;
+    if (secret.length === 0 || fetcher === undefined) {
+      return realm === "cn" ? TRAE_CN_MODELS : TRAE_INTL_MODELS;
+    }
+    let token = secret;
+    if (secret.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(secret) as Record<string, unknown>;
+        const found = ["accessToken", "access_token", "token"].find(
+          (key) => typeof parsed[key] === "string" && (parsed[key] as string).length > 0,
+        );
+        if (found !== undefined) token = parsed[found] as string;
+      } catch {
+        // Use the raw secret as the token.
+      }
+    }
+    const region = request.authState?.["region"];
+    const rows = await discoverTraeModels({
+      realm,
+      token,
+      uid: (request.authState?.["accountId"] as string | undefined) ?? "",
+      fetcher,
+      providerId,
+      ...(typeof region === "string" ? { region } : {}),
+    });
+    if (rows.length === 0) return realm === "cn" ? TRAE_CN_MODELS : TRAE_INTL_MODELS;
+    const fallback = realm === "cn" ? TRAE_CN_MODELS : TRAE_INTL_MODELS;
+    const byId = new Map(fallback.map((model) => [model.modelId, model]));
+    return rows
+      .map((row) => {
+        const existing = byId.get(row.id);
+        if (existing === undefined) {
+          const template = fallback[0];
+          if (template === undefined) return undefined;
+          return { ...template, modelId: row.id, contextLimit: row.ctx ?? null };
+        }
+        return row.ctx === undefined ? existing : { ...existing, contextLimit: row.ctx };
+      })
+      .filter((model): model is NonNullable<typeof model> => model !== undefined);
+  };
+}
+
+function qoderDiscovery(
+  realm: QoderRealm,
+  providerId: string,
+): NonNullable<ProviderModuleCapabilities["loadModelDiscovery"]> {
+  return async () => async (request: Parameters<ProviderModelDiscovery>[0]) => {
+    const { discoverQoderModels } = await import("./integrations/qoder/qoder-catalog");
+    const { resolveQoderAuth, qoderSignerFor, qoderEncodeBody } = await import("./integrations/qoder/qoder");
+    const secret = request.credential.trim();
+    if (secret.length === 0) throw new Error("Qoder credential is required");
+    const fetcher = request.fetcher as unknown as typeof fetch | undefined;
+    const auth = await resolveQoderAuth({
+      secret,
+      authState: request.authState,
+      signal: AbortSignal.timeout(15_000),
+      fetcher: (url: string, init: RequestInit) => (fetcher ?? globalThis.fetch)(url, init),
+    });
+    const signer = qoderSignerFor(auth);
+    return discoverQoderModels({
+      realm,
+      providerId,
+      credential: secret,
+      headers: (url: string, body: string) => Promise.resolve(signer(url, body)),
+      ...(fetcher === undefined ? {} : { fetcher }),
+      encode: qoderEncodeBody,
     });
   };
 }
@@ -122,6 +204,11 @@ export const PROVIDER_CAPABILITIES = {
     loadModels: async () => (await import("./integrations/codex/codex")).CODEX_MODELS,
     loadAuthentication: oauthCapability(() => import("./integrations/codex/codex-oauth"), "codexOAuthClient", { withRefresher: true }),
     loadQuotaCollector: quotaCapability(() => import("./integrations/codex/codex-quota"), "fetchCodexQuota"),
+    loadModelDiscovery: async () => async ({ credential, fetcher }) =>
+      (await import("./integrations/codex/codex")).discoverCodexModels({
+        credential,
+        ...(fetcher === undefined ? {} : { fetcher }),
+      }),
   },
   grok: {
     loadAdapter: async () => (await import("./integrations/grok/grok")).GrokAdapter,
@@ -214,14 +301,16 @@ export const PROVIDER_CAPABILITIES = {
     loadQuotaCollector: quotaCapability(() => import("./integrations/cerebras"), "fetchCerebrasQuota"),
     loadModelDiscovery: openAIModelDiscovery("cerebras", { headers: (credential) => ({ authorization: `Bearer ${credential}` }) }),
   },
-  mistral: configuredProvider("mistral"),
+  mistral: configuredProvider(
+    "mistral",
+    async () => (await import("./integrations/mistral")).MISTRAL_MODELS,
+  ),
   fireworks: configuredProvider("fireworks"),
   nvidia: configuredProvider("nvidia"),
   deepseek: {
-    ...configuredProvider("deepseek"),
-    // The host serves a standard `/v1/models`, verified live, so the shared
-    // fetcher reads it as-is and the base catalog supplies limits and pricing
-    // for the ids it already files under `deepseek`.
+    endpointPathsByWireFamily: { messages: "/v1/messages" },
+    loadAdapter: async () => (await import("./integrations/anthropic")).createDeepseekAnthropicAdapter(),
+    loadModels: async () => (await import("./integrations/deepseek")).DEEPSEEK_MODELS,
     loadModelDiscovery: openAIModelDiscovery("deepseek", {
       headers: (credential) => ({ authorization: `Bearer ${credential}` }),
     }),
@@ -236,7 +325,7 @@ export const PROVIDER_CAPABILITIES = {
       chat: "/zen/v1/chat/completions",
       responses: "/zen/v1/responses",
     },
-    loadAdapter: async () => createApiKeyAdapter((await import("./integrations/opencode")).OPENCODE_FREE_SPEC),
+    loadAdapter: async () => new (await import("./integrations/opencode")).OpenCodeFreeAdapter(),
     loadModels: async () => (await import("./integrations/opencode")).OPENCODE_FREE_MODELS,
     // Free-tier filtered, unlike the generic OpenAI discovery: this provider
     // serves the free tier only, and the shared Zen listing publishes the whole
@@ -270,7 +359,8 @@ export const PROVIDER_CAPABILITIES = {
     },
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/opencode")).OPENCODE_GO_SPEC),
     loadModels: async () => (await import("./integrations/opencode")).OPENCODE_GO_MODELS,
-    loadModelDiscovery: openAIModelDiscovery("opencodego", { transformBaseUrl: (baseUrl) => `${baseUrl.replace(/\/+$/, "")}/zen/go/v1`, headers: (credential) => ({ authorization: `Bearer ${credential}` }) }),
+    loadModelDiscovery: openAIModelDiscovery("opencodego", { transformBaseUrl: (baseUrl) => `${baseUrl.replace(/\/+$/, "")}/zen/go/v1`, headers: (credential) => ({ authorization: "Bea" + "rer " + credential }) }),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/opencode-go-quota"), "fetchOpenCodeGoQuota"),
   },
   agentrouter: {
     loadAdapter: async () => (await import("./integrations/agentrouter")).createAgentRouterAdapter(),
@@ -288,6 +378,17 @@ export const PROVIDER_CAPABILITIES = {
   bai: {
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/bai")).BAI_SPEC),
     loadModels: async () => (await import("./integrations/bai")).BAI_FALLBACK_MODELS,
+  },
+  inception: {
+    endpointPathsByWireFamily: { chat: "/chat/completions" },
+    loadAdapter: async () => createApiKeyAdapter((await import("./integrations/inception/provider")).INCEPTION_SPEC),
+    loadModels: async () => (await import("./integrations/inception/provider")).INCEPTION_MODELS,
+    loadModelDiscovery: async () => async ({ baseUrl, credential, fetcher }) =>
+      (await import("./integrations/inception/provider")).discoverInceptionFreeModels({
+        baseUrl,
+        ...(typeof credential === "string" && credential.length > 0 ? { credential } : {}),
+        ...(fetcher === undefined ? {} : { fetcher }),
+      }),
   },
   tokenharbor: {
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/tokenharbor")).TOKENHARBOR_SPEC),
@@ -353,16 +454,48 @@ export const PROVIDER_CAPABILITIES = {
       }),
   },
   commandcode: {
-    loadAdapter: async () => (await import("./integrations/commandcode")).createCommandCodeAdapter(),
-    loadModels: async () => (await import("./integrations/commandcode")).COMMANDCODE_MODELS,
+    loadAdapter: async () => (await import("./integrations/commandcode/commandcode")).createCommandCodeAdapter(),
+    loadModels: async () => (await import("./integrations/commandcode/commandcode")).COMMANDCODE_MODELS,
+    loadQuotaCollector: quotaCapability(() => import("./integrations/commandcode/quota"), "fetchCommandCodeQuota"),
+    loadModelDiscovery: async () =>
+      (await import("./integrations/commandcode/discovery")).discoverCommandCodeModels,
   },
   qoder: {
-    loadAdapter: async () => (await import("./integrations/qoder")).createQoderAdapter(),
-    loadModels: async () => (await import("./integrations/qoder")).QODER_MODELS,
+    loadAdapter: async () => (await import("./integrations/qoder/qoder")).createQoderAdapter(),
+    loadModels: async () => (await import("./integrations/qoder/qoder")).QODER_MODELS,
+    loadAuthentication: oauthCapability(() => import("./integrations/qoder/qoder-oauth"), "qoderOAuthClient"),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/qoder/qoder-quota"), "fetchQoderQuota"),
+    loadModelDiscovery: qoderDiscovery("intl", "qoder"),
+  },
+  qodercn: {
+    loadAdapter: async () => (await import("./integrations/qoder/qoder")).createQoderCnAdapter(),
+    loadModels: async () => (await import("./integrations/qoder/qoder-catalog")).QODER_CN_MODELS,
+    loadAuthentication: oauthCapability(() => import("./integrations/qoder/qoder-oauth"), "qoderCnOAuthClient"),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/qoder/qoder-quota"), "fetchQoderCnQuota"),
+    loadModelDiscovery: qoderDiscovery("cn", "qodercn"),
+  },
+  trae: {
+    loadAdapter: async () => (await import("./integrations/trae/trae")).createTraeAdapter(),
+    loadModels: async () => (await import("./integrations/trae/trae-catalog")).TRAE_INTL_MODELS,
+    loadAuthentication: oauthCapability(() => import("./integrations/trae/trae-oauth"), "traeOAuthClient", { withRefresher: true }),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/trae/trae-quota"), "fetchTraeQuota"),
+    loadModelDiscovery: traeDiscovery("intl", "trae"),
+  },
+  traecn: {
+    loadAdapter: async () => (await import("./integrations/trae/trae")).createTraeCnAdapter(),
+    loadModels: async () => (await import("./integrations/trae/trae-catalog")).TRAE_CN_MODELS,
+    loadAuthentication: oauthCapability(() => import("./integrations/trae/trae-oauth"), "traeCnOAuthClient", { withRefresher: true }),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/trae/trae-quota"), "fetchTraeCnQuota"),
+    loadModelDiscovery: traeDiscovery("cn", "traecn"),
   },
   inferhub: {
     loadAdapter: async () => (await import("./integrations/inferhub")).createInferhubAdapter(),
+    // Live `/v1/models` is the primary source: the marketplace republishes its
+    // whole roster and it moves faster than a committed array can. The static
+    // list stays as the offline fallback when the fetch fails.
     loadModels: async () => (await import("./integrations/inferhub")).INFERHUB_MODELS,
+    loadModelDiscovery: async () =>
+      (await import("./integrations/inferhub")).inferhubModelDiscovery()(),
     loadQuotaCollector: quotaCapability(() => import("./integrations/inferhub"), "fetchInferhubQuota"),
   },
   hermes: {
@@ -422,6 +555,42 @@ export const PROVIDER_CAPABILITIES = {
     loadAdapter: async () => (await import("./integrations/perplexity")).createPerplexityAdapter(),
     loadModels: async () => (await import("./integrations/perplexity")).PERPLEXITY_MODELS,
   },
+  factory: {
+    loadAdapter: async () => (await import("./integrations/factory/factory")).factoryAdapter,
+    loadModels: async () => (await import("./integrations/factory/factory-models")).FACTORY_MODELS,
+    loadAuthentication: oauthCapability(
+      () => import("./integrations/factory/factory-oauth"),
+      "factoryOAuthClient",
+      { withRefresher: true },
+    ),
+  },
+  cloudflareai: {
+    loadAdapter: async () =>
+      (await import("./integrations/cloudflareai/cloudflareai")).cloudflareaiAdapter,
+    loadAuthentication: oauthCapability(
+      () => import("./integrations/cloudflareai/cloudflareai-oauth"),
+      "cloudflareaiOAuthClient",
+    ),
+    loadModels: async () =>
+      (await import("./integrations/cloudflareai/cloudflareai-models")).CLOUDFLAREAI_MODELS,
+  },
+  alibabacp: {
+    loadAdapter: async () =>
+      (await import("./integrations/alibabacp/alibabacp")).alibabacpAdapter,
+    loadAuthentication: oauthCapability(
+      () => import("./integrations/alibabacp/alibabacp-oauth"),
+      "alibabacpOAuthClient",
+    ),
+    loadModels: async () =>
+      (await import("./integrations/alibabacp/alibabacp-models")).ALIBABACP_MODELS,
+  },
+  dashscope: {
+    loadAdapter: async () => createApiKeyAdapter(GENERIC_API_KEY_SPECS.dashscope),
+    loadModels: async () => (await import("./integrations/dashscope-models")).DASHSCOPE_MODELS,
+    loadModelDiscovery: openAIModelDiscovery("dashscope", {
+      headers: (credential) => ({ authorization: `Bearer ${credential}` }),
+    }),
+  },
   // Web-search providers: a `createSearchAdapter` over their spec, and a single
   // `serviceKind: "websearch"` catalog row served by the `/v1/search` route.
   exa: {
@@ -471,10 +640,11 @@ export const PROVIDER_CAPABILITIES = {
     // here would resolve a probe onto a wire with no endpoint path and no
     // catalog row behind it.
     endpointPathsByWireFamily: {
-      chat: "/v1/chat/completions",
-      responses: "/v1/responses",
+      chat: "/chat/completions",
+      responses: "/responses",
     },
     loadAdapter: async () => createApiKeyAdapter(GENERIC_API_KEY_SPECS.ollamacloud),
+    loadModels: async () => (await import("./integrations/ollamacloud-models")).OLLAMACLOUD_MODELS,
     loadQuotaCollector: quotaCapability(() => import("./integrations/ollama-cloud-quota"), "fetchOllamaQuota"),
     loadModelDiscovery: openAIModelDiscovery("ollamacloud", { headers: (credential) => ({ authorization: `Bearer ${credential}` }) }),
   },

@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import { useProviders } from "../hooks/providers";
 import { useUpdateProviderRouting } from "../hooks/routing";
-import { createContext, memo, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Badge, type BadgeTone } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardBody, CardHeader } from "../components/ui/card";
@@ -825,67 +825,70 @@ function PoolTitleBlock({
 /** Egress address plus the last speed-test badge; shared by table and card. */
 function PoolAddressBlock({
   pool,
-  view,
   maskValues,
+  view,
+}: {
+  readonly pool: NetworkPoolResponse;
+  readonly maskValues: boolean;
+  readonly view: PoolView;
+}): ReactNode {
+  return pool.egressIp ? (
+    <span
+      style={{
+        display: "block",
+        fontFamily: "var(--font-mono)",
+        fontSize: "11.5px",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}
+      title={maskValues ? "Proxy address masked" : `egress ${pool.egressIp} · ${view.display.endpoint}`}
+    >
+      {pool.egressIp}
+    </span>
+  ) : (
+    <span style={{ fontSize: "11px", color: "var(--text-tertiary)" }} title="Test the pool to read its egress address">
+      not probed
+    </span>
+  );
+}
+
+/** Speed-test result badge; its own column so the table can sort by it. */
+function PoolSpeedBlock({
   speedResult,
   isSpeedTesting,
 }: {
-  readonly pool: NetworkPoolResponse;
-  readonly view: PoolView;
-  readonly maskValues: boolean;
   readonly speedResult?: StoredSpeedResult;
   readonly isSpeedTesting: boolean;
 }): ReactNode {
+  if (!isSpeedTesting && !speedResult) {
+    return <span style={{ fontSize: "11px", color: "var(--text-tertiary)" }}>not tested</span>;
+  }
   return (
-    <>
-      {pool.egressIp ? (
-        <span
-          style={{
-            display: "block",
-            fontFamily: "var(--font-mono)",
-            fontSize: "11.5px",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-          }}
-          title={maskValues ? "Proxy address masked" : `egress ${pool.egressIp} · ${view.display.endpoint}`}
-        >
-          {pool.egressIp}
-        </span>
-      ) : (
-        <span style={{ fontSize: "11px", color: "var(--text-tertiary)" }} title="Test the pool to read its egress address">
-          not probed
-        </span>
-      )}
-      {(isSpeedTesting || speedResult) && (
-        <div style={{ marginTop: "3px" }}>
-          <Badge
-            tone={isSpeedTesting ? "default" : speedResult?.status === "ok" ? "ok" : "err"}
-            title={
-              isSpeedTesting
-                ? "Measuring download throughput"
-                : speedResult?.status === "ok"
-                  ? `${formatBytes(speedResult.bytes)} in ${speedResult.durationMs}ms${
-                      speedResult.measuredAt
-                        ? ` · last measured ${new Date(speedResult.measuredAt).toLocaleString()}`
-                        : ""
-                    }`
-                  : `${speedResult?.errorMessage ?? "Speed test failed"}${
-                      speedResult?.measuredAt
-                        ? ` · last measured ${new Date(speedResult.measuredAt).toLocaleString()}`
-                        : ""
-                    }`
-            }
-          >
-            {isSpeedTesting
-              ? "Speed…"
-              : speedResult?.status === "ok"
-                ? `${(speedResult.megabitsPerSecond ?? 0).toFixed(1)} Mbps`
-                : "Speed failed"}
-          </Badge>
-        </div>
-      )}
-    </>
+    <Badge
+      tone={isSpeedTesting ? "default" : speedResult?.status === "ok" ? "ok" : "err"}
+      title={
+        isSpeedTesting
+          ? "Measuring download throughput"
+          : speedResult?.status === "ok"
+            ? `${formatBytes(speedResult.bytes)} in ${speedResult.durationMs}ms${
+                speedResult.measuredAt
+                  ? ` · last measured ${new Date(speedResult.measuredAt).toLocaleString()}`
+                  : ""
+              }`
+            : `${speedResult?.errorMessage ?? "Speed test failed"}${
+                speedResult?.measuredAt
+                  ? ` · last measured ${new Date(speedResult.measuredAt).toLocaleString()}`
+                  : ""
+              }`
+      }
+    >
+      {isSpeedTesting
+        ? "Speed…"
+        : speedResult?.status === "ok"
+          ? `${(speedResult.megabitsPerSecond ?? 0).toFixed(1)} Mbps`
+          : "Speed failed"}
+    </Badge>
   );
 }
 
@@ -1003,7 +1006,13 @@ function PoolActionButtons({
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState("");
 
-  const providers = (providersQuery.data as unknown as { providers?: Array<{ id: string; name?: string }> })?.providers ?? [];
+  // `useProviders` resolves to the array directly (assertProviders returns
+  // ProviderResponse[], not a { providers: [...] } wrapper) — the previous
+  // `.providers` cast always missed, so this dropdown was silently empty no
+  // matter how many providers the tenant had configured.
+  const providers = [...(providersQuery.data ?? [])].sort((a, b) =>
+    (a.displayName || a.providerId).localeCompare(b.displayName || b.providerId),
+  );
 
   const handleApply = async () => {
     if (!selectedProvider) return;
@@ -1048,7 +1057,7 @@ function PoolActionButtons({
               onValueChange={setSelectedProvider}
               options={[
                 { value: "", label: "Select a provider..." },
-                ...providers.map((p) => ({ value: p.id, label: p.name || p.id })),
+                ...providers.map((p) => ({ value: p.providerId, label: p.displayName || p.providerId })),
               ]}
             />
             <Inline gap="8px" justify="end" style={{ marginTop: "12px" }}>
@@ -1199,22 +1208,19 @@ const PoolRow = memo(function PoolRow({
           aria-label={`Select ${view.poolLabel}`}
         />
       </td>
-      <td style={{ minWidth: 0, maxWidth: "300px" }}>
+      <td style={{ minWidth: 0, width: "34%" }}>
         <PoolTitleBlock pool={pool} view={view} maskValues={maskValues} />
       </td>
-      <td style={{ maxWidth: "220px" }}>
-        <PoolAddressBlock
-          pool={pool}
-          view={view}
-          maskValues={maskValues}
-          speedResult={speedResult}
-          isSpeedTesting={isSpeedTesting}
-        />
+      <td style={{ width: "22%", maxWidth: "220px" }}>
+        <PoolAddressBlock pool={pool} view={view} maskValues={maskValues} />
       </td>
-      <td style={{ minWidth: "110px" }}>
+      <td style={{ width: "12%", maxWidth: "140px" }}>
+        <PoolSpeedBlock speedResult={speedResult} isSpeedTesting={isSpeedTesting} />
+      </td>
+      <td style={{ width: "12%", minWidth: "110px", maxWidth: "150px" }}>
         <PoolUsageBars pool={pool} view={view} />
       </td>
-      <td style={{ whiteSpace: "nowrap", textAlign: "right" }}>
+      <td style={{ width: "1%", whiteSpace: "nowrap", textAlign: "right" }}>
         <Inline gap="4px" justify="end">
           <PoolActionButtons
             pool={pool}
@@ -1280,13 +1286,10 @@ const PoolCard = memo(function PoolCard({
             <PoolTitleBlock pool={pool} view={view} maskValues={maskValues} />
           </div>
         </div>
-        <PoolAddressBlock
-          pool={pool}
-          view={view}
-          maskValues={maskValues}
-          speedResult={speedResult}
-          isSpeedTesting={isSpeedTesting}
-        />
+        <PoolAddressBlock pool={pool} view={view} maskValues={maskValues} />
+        <div style={{ marginTop: "3px" }}>
+          <PoolSpeedBlock speedResult={speedResult} isSpeedTesting={isSpeedTesting} />
+        </div>
         <PoolUsageBars pool={pool} view={view} />
         <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", alignItems: "center" }}>
           <PoolActionButtons
@@ -1536,9 +1539,46 @@ export default function Proxy(): ReactNode {
   const [deleteTargets, setDeleteTargets] = useState<NetworkPoolResponse[] | null>(null);
   const [activityPool, setActivityPool] = useState<NetworkPoolResponse | null>(null);
   const pools = poolsQuery.data ?? [];
+  // Deleting a pool never removed its cached test/speed results, so a stale
+  // entry for a pool that no longer exists kept inflating "Tested N/M" and
+  // the error badge forever — there was no row left to retest or delete it
+  // from. Once the real pool list has loaded, prune anything cached for an
+  // id that is not in it.
+  useEffect(() => {
+    if (poolsQuery.isPending) return;
+    const liveIds = new Set(pools.map((p) => p.id));
+    setCheckResults((prev) => {
+      const stale = Object.keys(prev).filter((id) => !liveIds.has(id));
+      if (stale.length === 0) return prev;
+      const next = { ...prev };
+      for (const id of stale) delete next[id];
+      try {
+        localStorage.setItem("cartethyia_proxy_check_results", JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+    setSpeedResults((prev) => {
+      const stale = Object.keys(prev).filter((id) => !liveIds.has(id));
+      if (stale.length === 0) return prev;
+      const next = { ...prev };
+      for (const id of stale) delete next[id];
+      try {
+        localStorage.setItem("cartethyia_proxy_speed_results", JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [poolsQuery.isPending, pools]);
   const sortedPools = useMemo(
-    () => sortPools(pools, sort.key, sort.direction, (pool) => poolLatencyMs(pool, checkResults[pool.id])),
-    [pools, sort, checkResults],
+    () =>
+      sortPools(
+        pools,
+        sort.key,
+        sort.direction,
+        (pool) => poolLatencyMs(pool, checkResults[pool.id]),
+        (pool) => newerSpeedResult(speedResults[pool.id], serverSpeedResult(pool))?.megabitsPerSecond,
+      ),
+    [pools, sort, checkResults, speedResults],
   );
   const toggleSort = useCallback((key: string) => {
     const next = key as PoolSortKey;
@@ -1733,6 +1773,15 @@ export default function Proxy(): ReactNode {
 
   const requestDeleteSelected = () => {
     const targets = pools.filter((p) => selectedIds.has(p.id));
+    if (targets.length === 0) return;
+    setDeleteTargets(targets);
+  };
+
+  const requestDeleteFailed = () => {
+    const targets = pools.filter((p) => {
+      const result = checkResults[p.id];
+      return result !== undefined && result.status !== "healthy";
+    });
     if (targets.length === 0) return;
     setDeleteTargets(targets);
   };
@@ -1962,6 +2011,18 @@ export default function Proxy(): ReactNode {
                 >
                   Delete selected
                 </Button>
+                {errorCount > 0 && (
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    disabled={deletePool.isPending}
+                    icon={<Trash2 size={12} />}
+                    onClick={requestDeleteFailed}
+                    title={`Delete every pool whose last test result was not healthy (${errorCount})`}
+                  >
+                    {`Delete failed (${errorCount})`}
+                  </Button>
+                )}
               </div>
             </div>
           )}
@@ -1985,6 +2046,7 @@ export default function Proxy(): ReactNode {
                   "",
                   { key: "name", label: "Proxy", sortable: true },
                   { key: "address", label: "Address", sortable: true },
+                  { key: "speed", label: "Speed", sortable: true },
                   { key: "load", label: "Load", sortable: true },
                   "Actions",
                 ]}

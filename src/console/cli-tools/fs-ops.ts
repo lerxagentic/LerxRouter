@@ -12,7 +12,10 @@ import { join } from "node:path";
 import { mkdir, rm } from "node:fs/promises";
 
 /** Home directory — shared contract used by all injectors. */
-export { homedir as homeDir };
+export function homeDir(): string {
+  const override = platform() === "win32" ? process.env.USERPROFILE : process.env.HOME;
+  return override !== undefined && override.length > 0 ? override : homedir();
+}
 export { join };
 
 const IS_WIN: boolean = platform() === "win32";

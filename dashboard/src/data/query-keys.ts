@@ -60,6 +60,9 @@ export const queryKeys = {
   modelBans: {
     all: ["console", "model-bans"] as const,
   },
+  modelTemplates: {
+    all: ["console", "model-templates"] as const,
+  },
   settings: {
 
     runtime: ["console", "settings", "runtime"] as const,
@@ -77,6 +80,15 @@ export const queryKeys = {
     all: ["console", "quota"] as const,
     account: (accountId: string) => ["console", "quota", "account", accountId] as const,
     resets: (accountId: string) => ["console", "quota", "account", accountId, "resets"] as const,
+  },
+  inferhub: {
+    summary: ["console", "inferhub", "summary"] as const,
+    models: (prefix: string | undefined) => ["console", "inferhub", "models", prefix] as const,
+  },
+  operations: {
+    dataUsage: ["console", "data-management", "usage"] as const,
+    remoteSupport: ["console", "remote-support", "status"] as const,
+    release: ["console", "updates", "release"] as const,
   },
   studio: {
     sessions: ["console", "studio", "sessions"] as const,

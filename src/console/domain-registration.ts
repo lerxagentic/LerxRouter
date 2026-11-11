@@ -3,8 +3,12 @@ import { ConsoleDomainError } from "./shared/errors";
 import { createCliToolsRoutes } from "./cli-tools/routes";
 import { createAccountQuotaRoutes } from "./quota/account-quota";
 import { createApiKeyRoutes } from "./domains/api-keys/routes";
+import { createModelTemplateRoutes } from "./domains/model-templates/routes";
+import { DrizzleModelTemplateStore } from "../persistence/model-template-store";
 import { familyBucketSpend } from "./domains/api-keys/bucket-spend";
 import { createProviderCatalogRoutes } from "./providers/catalog/routes";
+import { createInferhubRoutes } from "./inferhub/routes";
+import { createInferhubKeyStore } from "./inferhub/key-store";
 import {
   createProviderDetailRoutes,
 } from "./providers/detail/routes";
@@ -23,6 +27,7 @@ import { createNetworkPoolRoutes } from "./routing/pools/routes";
 import { DrizzleModelRoutingStore } from "./routing/model/store";
 import { DrizzleNetworkPoolStore } from "./routing/pools/store";
 import { createRuntimeSettingsRoutes } from "./settings/contracts";
+import { createDataManagementRoutes } from "./data-management/routes";
 import { DrizzleRuntimeSettingsStore } from "./settings/store";
 import { createObservabilityRoutes } from "./observability/contracts";
 import { DrizzleObservabilityStore } from "./observability/store";
@@ -41,9 +46,18 @@ import { createBenchmarkRoutes } from "./domains/benchmark/contracts";
 import { DrizzleBenchmarkStore } from "./domains/benchmark/store";
 import { createBenchmarkProbe } from "./domains/benchmark/probe";
 import { createPerformanceRoutes } from "./observability/performance";
+import { createUpdateRoutes } from "./updates/routes";
+import { createRemoteSupportRoutes } from "./remote-support/routes";
+import { createRemoteSupportService } from "./remote-support/service";
 import { createBackupRoutes } from "./backup/routes";
+import { createPromptInjectionRoutes } from "./prompt-injection/routes";
+import { createNotificationRoutes } from "./notifications/routes";
+import { createCacheRoutes } from "./cache/routes";
+import { createMaintenanceRoutes } from "./maintenance/routes";
+import { createTotpRoutes } from "./auth/totp-routes";
 import { BackupService } from "./backup/service";
 import type { ConsoleCredentialService } from "./auth/service";
+import { healthEvents } from "../persistence/schema";
 
 import { OAuthFlowStore } from "../providers/authentication/oauth-flow-store";
 import { OAuthCallbackListener } from "./providers/oauth/callback-listener";
@@ -55,7 +69,7 @@ import { syncByokProvider } from "../providers/operations/provider-catalog-servi
 import { DrizzleApiKeyStore } from "../persistence/api-key-store";
 import { DrizzleShareLinkStore } from "../persistence/share-store";
 import { createShareUsagePort } from "./share/share-usage";
-import { resolveSsrfPolicy } from "../config";
+import { resolvePort, resolveSsrfPolicy } from "../config";
 import { createValidatedFetch } from "../network/outbound-fetch";
 import type { AuditRecorder } from "./auth/service";
 import type { CliToolService } from "./cli-tools/service";
@@ -70,6 +84,7 @@ import type { RedisClient } from "../persistence/redis";
 import type { ProviderRegistry } from "../providers/provider-registry";
 import type { BundledProviderCatalog } from "../providers/operations/provider-catalog-service";
 import type { ValidatedNetworkBindingFactory } from "../network/pool/resolver";
+import { createQuotaEgressFetcher } from "./quota/account-test-egress";
 import type { CartethyiaDatabase } from "../persistence/postgres";
 import type { ConsoleAccessResolver } from "./auth/access";
 
@@ -90,7 +105,7 @@ export interface ConsoleDomainContext {
   readonly stateStore?: ProxyRequestStateStore;
   readonly admissionService: Pick<ApiKeyAdmissionService, "purgeKey">;
   /** Graduated model-abuse strikes: list and lift bans from the console. */
-  readonly modelStrikes?: Pick<ModelStrikeService, "listBans" | "unban">;
+  readonly modelStrikes?: Pick<ModelStrikeService, "listBans" | "unban" | "ban">;
   readonly readRoutingAccountInflight?:
     | ((
         providerId: string,
@@ -208,10 +223,16 @@ export function registerConsoleDomains(
       ctx.readRoutingAccountInflight ? ctx.readRoutingAccountInflight(providerId, tenantId) : [],
   });
   const providerDetailStore = new DrizzleProviderDetailStore(ctx.db);
+  const quotaEgress = createQuotaEgressFetcher({
+    db: ctx.db,
+    poolSelector: ctx.poolSelector,
+    networkBindingFactory: ctx.networkBindingFactory,
+  });
   const networkPoolStore = new DrizzleNetworkPoolStore(ctx.db, resolveSsrfPolicy());
   const runtimeSettingsStore = new DrizzleRuntimeSettingsStore(ctx.db);
   const modelRoutingStore = new DrizzleModelRoutingStore(ctx.db);
   const apiKeyStore = new DrizzleApiKeyStore(ctx.db);
+  const modelTemplateStore = new DrizzleModelTemplateStore(ctx.db);
   const shareStore = new DrizzleShareLinkStore(ctx.db);
   const shareActivity = createShareUsagePort(ctx.db);
 
@@ -221,6 +242,7 @@ export function registerConsoleDomains(
     accessResolver: ctx.accessResolver,
     poolSelector: ctx.poolSelector,
     db: ctx.db,
+    telemetryBuffer: ctx.telemetryBuffer,
     ...(ctx.stateStore ? { stateStore: ctx.stateStore } : {}),
   }));
   console.use(createStudioRoutes({
@@ -242,7 +264,18 @@ export function registerConsoleDomains(
   }));
   console.use(createLogRoutes({ accessResolver: ctx.accessResolver, auditSink: ctx.auditRecorder }));
   console.use(createPerformanceRoutes({ accessResolver: ctx.accessResolver }));
+  console.use(createUpdateRoutes({ accessResolver: ctx.accessResolver, observabilityStore }));
+  console.use(createRemoteSupportRoutes({
+    accessResolver: ctx.accessResolver,
+    service: createRemoteSupportService({ port: resolvePort() }),
+  }));
   console.use(createAuditRoutes({ store: auditReadStore, accessResolver: ctx.accessResolver }));
+  const inferhubKeys = createInferhubKeyStore(ctx.db);
+  console.use(createInferhubRoutes({
+    accessResolver: ctx.accessResolver,
+    resolveConfigKey: () => inferhubKeys.read(),
+    keyStore: inferhubKeys,
+  }));
   console.use(createSecurityRoutes({
     db: ctx.db,
     strikes: ctx.modelStrikes,
@@ -288,6 +321,18 @@ export function registerConsoleDomains(
     relayFetch: createValidatedFetch({ policy: resolveSsrfPolicy() }),
   }));
   console.use(createRuntimeSettingsRoutes({ store: runtimeSettingsStore, accessResolver: ctx.accessResolver, auditSink: ctx.auditRecorder }));
+  console.use(createDataManagementRoutes({
+    telemetryDir: process.env.CARTETHYIA_TELEMETRY_DIR?.trim() || "./data/telemetry",
+    retentionDays: 30,
+    payloadRetentionMs: async () => Number(process.env.CARTETHYIA_TELEMETRY_PAYLOAD_RETENTION_MS ?? 15 * 60_000),
+    accessResolver: ctx.accessResolver,
+    auditSink: ctx.auditRecorder,
+    flusher: ctx.telemetryBuffer,
+    healthEvents: {
+      count: async () => (await ctx.db.select({ id: healthEvents.id }).from(healthEvents)).length,
+      purgeAll: async () => (await ctx.db.delete(healthEvents).returning({ id: healthEvents.id })).length,
+    },
+  }));
   console.use(
     createBackupRoutes({
       accessResolver: ctx.accessResolver,
@@ -311,6 +356,7 @@ export function registerConsoleDomains(
   );
   console.use(createModelRoutingRoutes({ store: modelRoutingStore, accessResolver: ctx.accessResolver, auditSink: ctx.auditRecorder, snapshotInvalidator: ctx.routeSnapshotService }));
   console.use(createApiKeyRoutes({ store: apiKeyStore, accessResolver: ctx.accessResolver, auditSink: ctx.auditRecorder, shareStore, shareActivity, admissionService: ctx.admissionService, bucketSpend: (keyId, now) => familyBucketSpend(ctx.db, keyId, now) }));
+  console.use(createModelTemplateRoutes({ store: modelTemplateStore, apiKeyStore, accessResolver: ctx.accessResolver, auditSink: ctx.auditRecorder }));
   console.use(createCliToolsRoutes({ service: ctx.cliToolService, accessResolver: ctx.accessResolver, auditSink: ctx.auditRecorder, snapshotInvalidator: ctx.routeSnapshotService }));
   console.use(createAccountQuotaRoutes({
     db: ctx.db,
@@ -320,6 +366,7 @@ export function registerConsoleDomains(
     snapshotInvalidator: ctx.routeSnapshotService,
     providerRegistry: ctx.providerRegistry,
     resolveCredential,
+    quotaFetcherFor: (accountId, tenantId, providerId) => quotaEgress(accountId, tenantId, providerId),
   }));
   // The listener binds the loopback port a browser redirect names, so the
   // callback delivers itself instead of waiting for a manual paste. One
@@ -340,4 +387,9 @@ export function registerConsoleDomains(
     callbackListener: oauthCallbackListener,
   };
   console.use(createOAuthLoginRoutes(oauthConfig));
+  console.use(createPromptInjectionRoutes({ db: ctx.db, accessResolver: ctx.accessResolver }));
+  console.use(createNotificationRoutes({ db: ctx.db, accessResolver: ctx.accessResolver }));
+  console.use(createCacheRoutes({ db: ctx.db, accessResolver: ctx.accessResolver }));
+  console.use(createMaintenanceRoutes({ db: ctx.db, accessResolver: ctx.accessResolver }));
+  console.use(createTotpRoutes({ db: ctx.db, accessResolver: ctx.accessResolver }));
 }

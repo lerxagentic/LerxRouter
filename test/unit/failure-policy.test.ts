@@ -910,7 +910,6 @@ describe("classifyUpstreamFailure", () => {
       "internal_error",
       "invalid_request",
       "upstream_not_found",
-      "context_length_exceeded",
       "policy_rejected",
       "transport_unavailable",
       "shutting_down",

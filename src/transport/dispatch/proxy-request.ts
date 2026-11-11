@@ -35,6 +35,8 @@ import { runAttemptLoop } from "./attempt-loop";
 import { dispatchFusionRequest } from "./fusion-dispatch";
 import { projectForRoute, routeCapabilitiesFor } from "../translation/capabilities";
 import { dispatchStreamingAttempt } from "./streaming-attempt";
+import { ResponseCache, globalResponseCache } from "../cache/response-cache";
+import { detectFlakyResponse } from "./flaky-guard";
 
 export interface ProviderProxyHandlerDeps {
   readonly db: CartethyiaDatabase;
@@ -185,6 +187,53 @@ export async function handleProviderProxyRequest(
       inboundHeaders,
       fusion: prepared.plan.fusion,
     }).then(({ events }) => encodeCanonicalResponse(canonicalRequest, events, state));
+  }
+  const cacheKey =
+    canonicalRequest.stream !== true && canonicalRequest.source_surface === "chat"
+      ? ResponseCache.buildCacheKey(state.ingressBody, {
+          tenantId: prepared.authorization.tenantId,
+          apiKeyId: prepared.authorization.id ?? "",
+          routeFingerprint: ResponseCache.stableStringify(
+            candidates.map((candidate) => ({
+              providerId: candidate.provider_id,
+              modelId: candidate.model_id,
+              endpoint: candidate.endpoint,
+              accountId: candidate.provider_account_id ?? null,
+              cooldownKind: candidate.cooldown_kind ?? null,
+              cooldownUntil: candidate.cooldown_until ?? null,
+              creditLimitEnabled: candidate.credit_limit_enabled ?? null,
+              creditLimit: candidate.credit_limit ?? null,
+              lastRemainingCredit: candidate.last_remaining_credit ?? null,
+              usageFloor: candidate.usage_floor ?? null,
+              usageFloorUnit: candidate.usage_floor_unit ?? null,
+              networkPoolIds: candidate.network_pool_ids ?? [],
+              networkPoolRequired: candidate.network_pool_required ?? false,
+              networkPoolLimits: candidate.network_pool_limits ?? {},
+              networkPoolWeights: candidate.network_pool_weights ?? {},
+              networkPoolRouting: candidate.network_pool_routing ?? null,
+              capabilityProfile: candidate.capability_profile,
+              userAgent: candidate.user_agent ?? null,
+              lane: candidate.lane ?? null,
+              requiresAccount: candidate.requires_account ?? null,
+              proOnly: candidate.pro_only ?? null,
+              accountPlan: candidate.account_plan ?? null,
+              tenantId: candidate.tenant_id ?? null,
+            })),
+          ),
+        })
+      : null;
+  if (cacheKey) {
+    const cached = globalResponseCache.get(cacheKey);
+    if (cached) {
+      metrics.proxy_requests_total.inc(1, { status: "completed" });
+      return new Response(cached.bytes as unknown as BodyInit, {
+        headers: {
+          "content-type": cached.contentType,
+          "x-lerx-cache": "HIT",
+          ...proxySuccessHeaders(state),
+        },
+      });
+    }
   }
   return runAttemptLoop<Response, ProviderAdapter>({
     state,
@@ -358,6 +407,18 @@ export async function handleProviderProxyRequest(
                   echo: canonicalRequest.generation_controls["extension:completion.echo"] === true,
                   suffix: canonicalRequest.generation_controls["extension:completion.suffix"],
                 });
+      const responseText = new TextDecoder().decode(output.bytes);
+      const parsedResponseBody = parseCapturedBody(responseText);
+      const flakyVerdict = detectFlakyResponse(parsedResponseBody);
+      if (flakyVerdict.flaky && context.attemptIndex < candidates.length - 1) {
+        throw new GatewayError(
+          "platform_unavailable",
+          502,
+          `Upstream provider returned an empty or degenerate response (${flakyVerdict.reason ?? "unknown"})`,
+          { flakyReason: flakyVerdict.reason },
+          "upstream",
+        );
+      }
       await completeAttempt(state, {
         status: "completed",
         ...completionContext({
@@ -377,20 +438,20 @@ export async function handleProviderProxyRequest(
         ...ttfbFields(undefined, firstContentDeltaAtMs, state.upstreamDispatchStartedAtMs),
         usage: pricedUsage,
         commitUsage: pricedUsage,
-        // Decode once: `output.bytes` is a `Uint8Array`, which
-        // `parseCapturedBody` returns untouched — the Server panel would store
-        // a byte-index map (`{"0":123,…}`) after redaction instead of the
-        // response. The client receives the same text we parse here, so both
-        // panels stay in sync.
-        responseBody: parseCapturedBody(new TextDecoder().decode(output.bytes)),
-        // Non-stream: client receives the exact same bytes we just encoded —
-        // keep Server and Client panels in sync so the drawer never shows “—”.
-        clientResponseText: new TextDecoder().decode(output.bytes),
+        responseBody: parsedResponseBody,
+        clientResponseText: responseText,
         ...(firstContentDeltaAtMs !== undefined ? { firstContentDeltaAtMs } : {}),
       });
       metrics.proxy_requests_total.inc(1, { status: "completed" });
+      if (cacheKey && terminal.state === "complete") {
+        globalResponseCache.put(cacheKey, output.bytes, output.content_type);
+      }
       return new Response(output.bytes as unknown as BodyInit, {
-        headers: { "content-type": output.content_type, ...proxySuccessHeaders(state) },
+        headers: {
+          "content-type": output.content_type,
+          ...(cacheKey ? { "x-lerx-cache": "MISS" } : {}),
+          ...proxySuccessHeaders(state),
+        },
       });
     },
   });

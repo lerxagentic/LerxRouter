@@ -13,7 +13,7 @@ import type { TelemetryBatchBuffer } from "../../../observability/telemetry-buff
 import { gatewayErrorSql } from "../../../observability/telemetry-status";
 import type { BundledProviderCatalog } from "../../../providers/operations/provider-catalog-service";
 import type { AccountInflightReading, ByokConnectionTestRequest, ByokConnectionTestResult, CreateProviderAccountRequest, CredentialMode, ModelCatalogEntry, ProbeAllAccountsResult, ProbeAllModelsResult, ProbeModelRequest, ProbeModelResult, ProviderAccountResponse, ProviderAccountTokenUsage, ProviderCatalogStore, ProviderRecord, SetModelEnabledRequest, UpdateProviderAccountRequest } from "./contracts";
-import { validateCompatibilityProfile } from "./contracts";
+import { isGenericWireFamily, validateCompatibilityProfile } from "./contracts";
 import { ProviderProbingService, type ProbeOutboundResolver } from "../../../providers/discovery/probing-service";
 import { resolveManualModelMetadata } from "../../../providers/model-definition";
 import { isUniqueViolation } from "../../../persistence/postgres";
@@ -51,7 +51,9 @@ function parseExpiry(value: unknown): Date | undefined {
   }
   return undefined;
 }
-function parseJwtCredential(raw: string): { readonly expiresAt?: Date } | undefined {
+function parseJwtCredential(
+  raw: string,
+): { readonly expiresAt?: Date; readonly issuer?: string } | undefined {
   const segments = raw.trim().split(".");
   if (segments.length !== 3) return undefined;
   try {
@@ -61,7 +63,12 @@ function parseJwtCredential(raw: string): { readonly expiresAt?: Date } | undefi
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
     const exp = (payload as Record<string, unknown>)["exp"];
     const expiresAt = parseExpiry(exp);
-    return expiresAt === undefined ? {} : { expiresAt };
+    const iss = (payload as Record<string, unknown>)["iss"];
+    const issuer = typeof iss === "string" && iss.trim().length > 0 ? iss.trim() : undefined;
+    return {
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+      ...(issuer === undefined ? {} : { issuer }),
+    };
   } catch {
     return undefined;
   }
@@ -457,7 +464,15 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     if (!owner[0]) {
       throw new ConsoleDomainError("provider_not_found", 404, `Provider ${providerId} not found`);
     }
-    const family = (wireFamily ?? "chat") as WireFamily;
+    const requestedFamily = wireFamily ?? "chat";
+    if (!isGenericWireFamily(requestedFamily)) {
+      throw new ConsoleDomainError(
+        "invalid_wire_family",
+        400,
+        "wireFamily must be one of chat, responses, messages",
+      );
+    }
+    const family: WireFamily = requestedFamily;
     // Static endpoint from the provider's own bundled catalog via the probing
     // service (the same startup-built map this store is constructed with).
     // Without this, bundled providers on versioned bases (cline) get the
@@ -860,6 +875,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
         const requestedCredentialMode: CredentialMode = request.credentialMode ?? "auto";
         let effectiveCredentialMode: CredentialMode = requestedCredentialMode;
         let tokenExpiresAt: Date | undefined;
+        let jwtIssuer: string | undefined;
         let oauthRefreshCiphertext: Buffer | undefined;
         let oauthExpiresAt: Date | undefined;
         let oauthHasRefreshToken = false;
@@ -913,6 +929,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
               effectiveCredentialKind = "api_key";
               effectiveCredentialMode = "jwt";
               tokenExpiresAt = parsedJwt.expiresAt;
+              jwtIssuer = parsedJwt.issuer;
             } else if (request.credentialKind === "oauth" || hasRefreshToken) {
               effectiveSecret = parts.accessToken;
               effectiveCredentialKind = hasRefreshToken ? "oauth" : "api_key";
@@ -938,6 +955,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
           ...(request.authState ?? {}),
           credentialMode: effectiveCredentialMode,
           ...(tokenExpiresAt === undefined ? {} : { tokenExpiresAt: tokenExpiresAt.toISOString() }),
+          ...(jwtIssuer === undefined ? {} : { jwtIssuer }),
         };
         const nextSortIndex = await this.nextAccountSortIndex(tx, providerId, tenantId);
         const rows = await tx
@@ -1091,6 +1109,8 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
         : undefined;
     const tokenExpiresAt =
       typeof authState?.["tokenExpiresAt"] === "string" ? authState["tokenExpiresAt"] : undefined;
+    const jwtIssuer =
+      typeof authState?.["jwtIssuer"] === "string" ? authState["jwtIssuer"] : undefined;
     return {
       id: row.id,
       providerId: row.providerId,
@@ -1099,6 +1119,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       credentialKind: row.credentialKind,
       ...(credentialMode === undefined ? {} : { credentialMode }),
       ...(tokenExpiresAt === undefined ? {} : { tokenExpiresAt }),
+      ...(jwtIssuer === undefined ? {} : { jwtIssuer }),
       status: row.status,
       ...(usage.inflight === undefined ? {} : { inflight: usage.inflight }),
       usageToday: usage.today,

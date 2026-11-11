@@ -63,3 +63,8 @@ CHANGELOG.md
 
 # Project-specific
 docker-compose*.yml
+
+# The runtime image ships the official OpenCode CLI and its required license.
+!third-party/
+!third-party/opencode/
+!third-party/opencode/LICENSE

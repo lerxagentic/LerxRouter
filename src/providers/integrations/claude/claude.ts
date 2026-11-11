@@ -36,6 +36,45 @@ import { sleep } from "../../../transport/failure-policy";
  * `MIN_RETRY_BUDGET_MS` in the attempt loop.
  */
 const SLOW_LANE_DEADLINE_FLOOR_MS = 15_000;
+
+/** Recognizes only the server's explicit minimum-CLI-version 400 response. */
+function requiredClaudeCliVersion(error: unknown): string | undefined {
+  if (!(error instanceof GatewayError) || error.status !== 400) return undefined;
+  const match = /claude_code_version_too_old[\s\S]{0,200}?\bversion\s+(\d+\.\d+\.\d+)\b/i.exec(
+    error.message,
+  );
+  return match?.[1];
+}
+
+/** Rebuilds a serialized OAuth payload with the server-required billing version. */
+function rebuildClaudeBillingBody(
+  body: string,
+  request: CanonicalRequest,
+  cliVersion: string,
+): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed["system"])) return undefined;
+  let replaced = false;
+  const userText = firstUserText(request);
+  const system = parsed["system"].map((block: unknown) => {
+    if (
+      !isRecord(block) ||
+      typeof block["text"] !== "string" ||
+      !block["text"].startsWith(CLAUDE_BILLING_HEADER_PREFIX)
+    ) {
+      return block;
+    }
+    replaced = true;
+    return { ...block, text: createClaudeBillingText(userText, cliVersion) };
+  });
+  return replaced ? JSON.stringify({ ...parsed, system }) : undefined;
+}
+
 import { resolvePromptCacheKey } from "../../operations/session-resolution";
 import { ensureAnthropicBeta, filterClaudeCustomHeaders } from "../claude-messages";
 import {
@@ -45,6 +84,16 @@ import {
 } from "./claude-cch";
 import { getClaudeCliVersion, getClaudeSdkVersion } from "../../operations/client-versions";
 import { getOrCreateInstallId } from "../install-id";
+import { CLAUDE_USER_PROFILES_BETA } from "./claude-user-profiles";
+import {
+  FALLBACK_CREDIT_BETA,
+  fallbackCreditCacheKey,
+  fallbackCreditRequestBody,
+  fallbackCreditTargetModel,
+  isFallbackCreditTokenRejection,
+  refusalCreditToken,
+  sharedFallbackCreditCache,
+} from "./fallback-credit";
 import { canonicalToClaudeMessagesPayload } from "../../../protocol/request/messages";
 import { applyParamQuirks } from "../../../transport/translation/quirks";
 import { CLAUDE_BILLING_HEADER_PREFIX, endpointUrl } from "../../../protocol/primitives";
@@ -228,14 +277,26 @@ export class ClaudeAdapter implements ProviderAdapter {
         : { request_headers: context.request_headers }),
       ...(incomingBeta === undefined ? {} : { anthropic_beta: incomingBeta }),
     };
-    const headers: Record<string, string> = buildClaudeHeaders(
-      context.credential.secret,
-      context.credential.account_id,
-      headerOptions,
-    );
     const profileId = request.generation_controls["extension:user_profile_id"];
-    if (typeof profileId === "string" && profileId.length > 0)
-      ensureAnthropicBeta(headers, "user-profiles");
+    const safeProfileId =
+      typeof profileId === "string" &&
+      profileId.length > 0 &&
+      !/[\u0000-\u001f\u007f]/u.test(profileId)
+        ? profileId
+        : undefined;
+    const headersForVersion = (version: string): Record<string, string> => {
+      const nextHeaders = buildClaudeHeaders(
+        context.credential.secret,
+        context.credential.account_id,
+        { ...headerOptions, cli_version: version },
+      );
+      if (safeProfileId !== undefined) {
+        nextHeaders["anthropic-user-profile-id"] = safeProfileId;
+        ensureAnthropicBeta(nextHeaders, CLAUDE_USER_PROFILES_BETA);
+      }
+      return nextHeaders;
+    };
+    const headers: Record<string, string> = headersForVersion(cliVersion);
     const sessionId = headers["X-Claude-Code-Session-Id"] ?? resolvePromptCacheKey(request);
     // Provider/model parameter quirks run before translation, exactly as they do
     // on the API-key (`anthropic`) path. Without this call the Claude Code
@@ -300,18 +361,43 @@ export class ClaudeAdapter implements ProviderAdapter {
       candidate.endpoint_path || "/v1/messages",
       isClaudeCodeOAuth,
     );
-    const requestBody = JSON.stringify(payload);
-    const patchedBody = isClaudeCodeOAuth ? patchClaudeCchBody(requestBody) : undefined;
-    if (isClaudeCodeOAuth && patchedBody === undefined) {
-      // Unanchored billing block: warn and send as-is, exactly like the
-      // reference client. Availability wins over attestation here — an
-      // unattested send is the accepted fallback, a 500 is a self-DoS.
-      log.warn("claude billing attestation unanchored; sending unattested", {
-        provider: "claude",
-      });
-    }
-    const outboundBody =
-      patchedBody === undefined ? requestBody : new TextDecoder().decode(patchedBody);
+    const baseRequestBody = JSON.stringify(payload);
+    const fallbackAccountId = context.credential.account_id;
+    const fallbackKey =
+      isClaudeCodeOAuth && typeof fallbackAccountId === "string" && fallbackAccountId.length > 0
+        ? fallbackCreditCacheKey(
+            baseRequestBody,
+            context.credential.provider_id,
+            fallbackAccountId,
+          )
+        : undefined;
+    const fallbackToken =
+      fallbackKey === undefined ? undefined : sharedFallbackCreditCache.get(fallbackKey);
+    const creditRequestBody =
+      fallbackToken === undefined
+        ? undefined
+        : fallbackCreditRequestBody(
+            baseRequestBody,
+            fallbackToken,
+            fallbackCreditTargetModel(request.provider_options),
+          );
+    const usesFallbackCredit =
+      fallbackToken !== undefined && creditRequestBody !== undefined;
+    if (usesFallbackCredit && fallbackKey !== undefined) sharedFallbackCreditCache.delete(fallbackKey);
+
+    const makeOutboundBody = (body: string): string => {
+      const patchedBody = isClaudeCodeOAuth ? patchClaudeCchBody(body) : undefined;
+      if (isClaudeCodeOAuth && patchedBody === undefined) {
+        // Unanchored billing block: warn and send as-is, exactly like the
+        // reference client. Availability wins over attestation here — an
+        // unattested send is the accepted fallback, a 500 is a self-DoS.
+        log.warn("claude billing attestation unanchored; sending unattested", {
+          provider: "claude",
+        });
+      }
+      return patchedBody === undefined ? body : new TextDecoder().decode(patchedBody);
+    };
+    const outboundBody = makeOutboundBody(creditRequestBody ?? baseRequestBody);
 
     // Slow lane (design doc §5): attach the usage limit when this account's
     // lane is active, so the upstream knows it may serve us on spare capacity.
@@ -321,27 +407,86 @@ export class ClaudeAdapter implements ProviderAdapter {
     const slowHeaders: Record<string, string> = slowEligible
       ? { ...headers, "anthropic-usage-limit": "slow" }
       : headers;
+    const attemptHeaders: Record<string, string> = { ...slowHeaders };
+    if (usesFallbackCredit) ensureAnthropicBeta(attemptHeaders, FALLBACK_CREDIT_BETA);
 
-    const executeSend = () =>
-      sendClaudeMessagesRequest(
-        url,
-        slowHeaders,
-        outboundBody,
-        context,
-        request,
-        this.fetchFn,
-        isClaudeCodeOAuth,
-      );
+    const fetchFn = this.fetchFn;
+    const executeSend = (body: string, sendHeaders: Record<string, string>) =>
+      (async function* (): AsyncIterable<CanonicalEvent> {
+        for await (const event of sendClaudeMessagesRequest(
+          url,
+          sendHeaders,
+          body,
+          context,
+          request,
+          fetchFn,
+          isClaudeCodeOAuth,
+        )) {
+          if (event.type === "terminal") {
+            const token = refusalCreditToken(event.stop_details);
+            if (token !== undefined && fallbackKey !== undefined) {
+              sharedFallbackCreditCache.set(fallbackKey, token);
+            }
+          }
+          yield event;
+        }
+      })();
 
     try {
-      yield* executeSend();
+      yield* executeSend(outboundBody, attemptHeaders);
       return;
     } catch (error: unknown) {
+      const requiredVersion = requiredClaudeCliVersion(error);
+      if (requiredVersion !== undefined && requiredVersion !== cliVersion) {
+        const retryRequestBody = rebuildClaudeBillingBody(
+          creditRequestBody ?? baseRequestBody,
+          request,
+          requiredVersion,
+        );
+        if (retryRequestBody !== undefined) {
+          const versionHeaders = headersForVersion(requiredVersion);
+          const retrySlowHeaders: Record<string, string> = slowEligible
+            ? { ...versionHeaders, "anthropic-usage-limit": "slow" }
+            : versionHeaders;
+          const retryHeaders: Record<string, string> = { ...retrySlowHeaders };
+          if (usesFallbackCredit) ensureAnthropicBeta(retryHeaders, FALLBACK_CREDIT_BETA);
+          const retryOutboundBody = makeOutboundBody(retryRequestBody);
+          const executeVersionRetry = () => executeSend(retryOutboundBody, retryHeaders);
+          try {
+            yield* executeVersionRetry();
+            return;
+          } catch (retryError: unknown) {
+            if (usesFallbackCredit && isFallbackCreditTokenRejection(retryError)) {
+              const standardRetryBody = rebuildClaudeBillingBody(
+                baseRequestBody,
+                request,
+                requiredVersion,
+              );
+              if (standardRetryBody !== undefined) {
+                yield* executeSend(makeOutboundBody(standardRetryBody), retrySlowHeaders);
+                return;
+              }
+            }
+            if (slowEligible && accountId !== undefined) {
+              const waited = await this.planAndWaitSlowLane(retryError, accountId, context);
+              if (waited) {
+                yield* executeVersionRetry();
+                return;
+              }
+            }
+            throw retryError;
+          }
+        }
+      }
+      if (usesFallbackCredit && isFallbackCreditTokenRejection(error)) {
+        yield* executeSend(makeOutboundBody(baseRequestBody), slowHeaders);
+        return;
+      }
       if (slowEligible && accountId !== undefined) {
         const waited = await this.planAndWaitSlowLane(error, accountId, context);
         if (waited) {
           // Same account, same bytes: retry after waiting
-          yield* executeSend();
+          yield* executeSend(outboundBody, attemptHeaders);
           return;
         }
       }
@@ -385,6 +530,50 @@ export class ClaudeAdapter implements ProviderAdapter {
       return false;
     }
     return true;
+  }
+
+  async dispatchNativeService(
+    body: Record<string, unknown>,
+    candidate: ProviderDispatchTarget,
+    context: ProviderDispatchContext,
+  ): Promise<Response> {
+    const isClaudeCodeOAuth =
+      context.credential.credential_kind === "oauth" ||
+      context.credential.credential_kind === "scoped_access_token";
+    const customHeaders = filterClaudeCustomHeaders({
+      ...this.customHeaders,
+      ...context.credential.custom_headers,
+    });
+    const headerOptions: ClaudeHeaderOptions = {
+      credential_kind: context.credential.credential_kind,
+      custom_headers: customHeaders,
+      capabilities: candidate.capabilities,
+      unsupported_beta_policy: "reject",
+      target_provider: "claude",
+      has_thinking: false,
+      has_tools: false,
+      stream: false,
+      cli_version: getClaudeCliVersion(),
+      sdk_version: getClaudeSdkVersion(),
+      ...(context.request_headers === undefined ? {} : { request_headers: context.request_headers }),
+    };
+    const headers = buildClaudeHeaders(
+      context.credential.secret,
+      context.credential.account_id,
+      headerOptions,
+    );
+    const url = endpointUrl(
+      this.baseUrl,
+      candidate.endpoint_path || "/v1/messages/count_tokens",
+      isClaudeCodeOAuth,
+    );
+    const fetchFn = context.outbound_fetch ?? this.fetchFn;
+    return fetchFn(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: context.abort_signal,
+    });
   }
 }
 

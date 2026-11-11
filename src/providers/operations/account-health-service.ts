@@ -46,28 +46,12 @@ const UNCLASSIFIED_COOLDOWN_MS = resolveAccountUnclassifiedCooldownMs;
  */
 const GROK_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 /**
- * The buddy family (CodeBuddy `cb`/`cbcn`, WorkBuddy) answers a content-policy
- * rejection with HTTP 403 code `11140` ("request illegal" / "did not pass the
- * safety review"). Unlike a normal one-off content filter, the account stays
- * blocked for *every* subsequent invocation until the upstream cools off, so
- * the account is parked for a long cooldown instead of being left in rotation
- * to fail every request. It is a cooldown, not `disabled`: the credential is
- * valid and the block clears on its own, so an operator does not have to
- * re-enable it by hand.
- */
-const POLICY_BLOCK_COOLDOWN_MS = 24 * 60 * 60 * 1000;
-/**
  * The buddy family also answers with HTTP 400 code `11128` ("Illegal API
  * invocation from an unapproved channel") when it rejects the calling channel
- * rather than the content. Like the policy block it is account-wide and
- * repeats on every invocation until the upstream lifts it, so the account is
- * parked the same way. Shorter than the policy block: a channel rejection can
- * follow a transient upstream rule change, while a content-policy block
- * follows a request the account itself made.
+ * rather than the content. It repeats on every invocation until the upstream
+ * lifts it, so verified upstream/account evidence gets the configured short
+ * transient cooldown instead of being left in rotation.
  */
-const CHANNEL_BLOCK_COOLDOWN_MS = 6 * 60 * 60 * 1000;
-/** Providers whose `11140` policy block parks the account for a long cooldown. */
-
 // ===== health/account-recorder.ts =====
 export interface AccountHealthEventRecord {
   readonly id: string;
@@ -86,6 +70,8 @@ export type AccountErrorCategory =
   | "model_capacity"
   | "auth_invalidated"
   | "policy_blocked"
+  | "policy_blocked_banned"
+  | "policy_blocked_invalid_request"
   | "server_error"
   | "timeout"
   | "unknown";
@@ -124,6 +110,38 @@ export interface AccountFailureEvidence {
    * content-policy block), never to broaden what disables an account.
    */
   readonly providerId?: string;
+  /** Parsed upstream JSON, used for verdict text and structured reset windows. */
+  readonly upstreamBody?: unknown;
+}
+
+function stringsIn(value: unknown, depth = 0): string[] {
+  if (depth > 5) return [];
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap((item) => stringsIn(item, depth + 1));
+  if (!isRecord(value)) return [];
+  return Object.values(value).flatMap((item) => stringsIn(item, depth + 1));
+}
+
+function structuredResetMs(value: unknown, depth = 0): number | null {
+  if (depth > 5 || !isRecord(value)) return null;
+  for (const [key, nested] of Object.entries(value)) {
+    const normalized = key.toLowerCase().replace(/[_-]/g, "");
+    if (typeof nested === "number" && Number.isFinite(nested) && nested >= 0) {
+      if (normalized === "resetms" || normalized === "retryafterms") return nested;
+      if (normalized === "seconds" || normalized === "resetseconds" || normalized === "retryafter") {
+        return nested * 1000;
+      }
+    }
+    const found = structuredResetMs(nested, depth + 1);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+function buddyBodyIsBan(body: unknown): boolean {
+  const lower = stringsIn(body).join(" ").toLowerCase();
+  return lower.includes("restricted") || lower.includes("unusual activity") ||
+    lower.includes("appeal") || lower.includes("账号存在异常行为") || lower.includes("帳號存在異常行為");
 }
 
 export interface AccountErrorClassification {
@@ -183,13 +201,14 @@ export function classifyAccountError(
     options?.retryAfterMs ??
     parseUpstreamBackoff({ get: getHeader });
   const messageCooldown = parseProviderResetDuration(message);
+  const bodyCooldown = structuredResetMs(options?.upstreamBody);
   const reason = (prefix: string): string => `${prefix}: ${message.slice(0, 160)}`;
   // A deadline is "stated" only when the upstream named it — a `Retry-After`/
   // reset header or a duration written in the message. The classifier's own
   // fallbacks are guesses, and a guess must never take the hard model-scoped
   // exclusion: it would sideline an (account, model) pair the provider never
   // actually declared exhausted.
-  const deadlineStated = headerCooldown != null || messageCooldown != null;
+  const deadlineStated = headerCooldown != null || messageCooldown != null || bodyCooldown != null;
   const result = (
     category: AccountErrorCategory,
     status: AccountErrorClassification["status"],
@@ -268,13 +287,24 @@ export function classifyAccountError(
     options?.providerId !== undefined &&
     BUDDY_PROVIDER_IDS.has(options.providerId.toLowerCase());
   if (policyBlock) {
+    const messageNamesBan = lower.includes("account suspended") || lower.includes("account has been banned");
+    if ((providerCode === "11140" && buddyBodyIsBan(options?.upstreamBody)) || messageNamesBan) {
+      return result(
+        "policy_blocked_banned",
+        "disabled",
+        0,
+        null,
+        reason("Account banned by upstream"),
+        origin === "upstream",
+      );
+    }
     return result(
-      "policy_blocked",
+      "policy_blocked_invalid_request",
       "cooldown",
-      POLICY_BLOCK_COOLDOWN_MS,
-      new Date(Date.now() + POLICY_BLOCK_COOLDOWN_MS),
-      reason("Provider content-policy block"),
-      origin === "upstream",
+      0,
+      null,
+      reason("Upstream refused this request"),
+      false,
     );
   }
   // A channel rejection (`11128`) is the same shape: the upstream is refusing
@@ -284,19 +314,21 @@ export function classifyAccountError(
   // request — and since every account failed the same way, the whole pool
   // looked dead with nothing ever parked.
   const channelRejection =
-    providerCode === "11128" || lower.includes("unapproved channel");
+    providerCode === "11128" || providerCode === "11-128" || lower.includes("unapproved channel") || lower.includes("conversation id missing");
   const channelBlock =
     channelRejection &&
+    canMutate &&
     options?.providerId !== undefined &&
     BUDDY_PROVIDER_IDS.has(options.providerId.toLowerCase());
   if (channelBlock) {
+    const cooldownMs = TRANSIENT_ERROR_COOLDOWN_MS();
     return result(
       "policy_blocked",
       "cooldown",
-      CHANNEL_BLOCK_COOLDOWN_MS,
-      new Date(Date.now() + CHANNEL_BLOCK_COOLDOWN_MS),
+      cooldownMs,
+      new Date(Date.now() + cooldownMs),
       reason("Provider channel rejection"),
-      origin === "upstream",
+      true,
     );
   }
   // A hosted-tool failure is a per-request outcome of the provider's own
@@ -395,7 +427,7 @@ export function classifyAccountError(
       lower.includes("included free usage") ||
       lower.includes("rolling 24-hour") ||
       lower.includes("rolling 24 hour");
-    const statedCooldown = messageCooldown ?? headerCooldown;
+    const statedCooldown = bodyCooldown ?? messageCooldown ?? headerCooldown;
     const cooldownMs = grokFreeTier
       ? (statedCooldown ?? GROK_QUOTA_COOLDOWN_MS)
       : (statedCooldown ?? DEFAULT_QUOTA_COOLDOWN_MS());
@@ -424,7 +456,7 @@ export function classifyAccountError(
     lower.includes("tpm limit") ||
     lower.includes("rpm limit");
   if (rateSignal) {
-    const statedCooldown = headerCooldown ?? messageCooldown;
+    const statedCooldown = headerCooldown ?? bodyCooldown ?? messageCooldown;
     // An upstream that names its reset window is authoritative. When it names
     // none, the limit is a momentary throttle and the backoff must be short: a
     // bare 429 carries no window, and parking the account for the long fallback
@@ -460,7 +492,7 @@ export function classifyAccountError(
     lower.includes("capacity exceeded") ||
     lower.includes("temporarily unavailable");
   if (capacitySignal) {
-    const cooldownMs = headerCooldown ?? messageCooldown ?? MODEL_CAPACITY_COOLDOWN_MS();
+    const cooldownMs = headerCooldown ?? bodyCooldown ?? messageCooldown ?? MODEL_CAPACITY_COOLDOWN_MS();
     const modelScopedMutation =
       origin === "upstream" && scope === "account" && options?.modelId !== undefined;
     return result(

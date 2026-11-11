@@ -5,6 +5,7 @@
 import { GatewayError } from "../../../transport/gateway-error";
 import { type ServiceKind, type WireFamily, SERVICE_KINDS, WIRE_FAMILIES } from "../../../transport/canonical-model";
 import { type ProviderRoutingSetting, type ProviderRoutingStrategy } from "../../../transport/routing/route-model";
+import type { UsageFloorUnit } from "../../../transport/routing/usage-floor";
 import { isProtectedHeader } from "../../../security/outbound-headers";
 import type { AccountHealthEventRecord } from "../../../providers/operations/account-health-service";
 import type { CompatibilityProfile } from "../../../providers/provider-metadata";
@@ -66,10 +67,18 @@ const VALID_WIRE_FAMILIES: Record<WireFamily, true> = {
   chat: true,
   responses: true,
   messages: true,
+  gemini: true,
 };
 
 export function isWireFamily(value: unknown): value is WireFamily {
   return typeof value === "string" && value in VALID_WIRE_FAMILIES;
+}
+
+/** Wires served by the generic BYOK adapter; Gemini is Factory's bespoke transport. */
+export function isGenericWireFamily(
+  value: unknown,
+): value is Exclude<WireFamily, "gemini"> {
+  return value === "chat" || value === "responses" || value === "messages";
 }
 
 /**
@@ -85,6 +94,8 @@ const VALID_SERVICE_KINDS: Record<ServiceKind, true> = {
   systemone: true,
   websearch: true,
   images: true,
+  imageGeneration: true,
+  videoGeneration: true,
 };
 
 export function isServiceKind(value: unknown): value is ServiceKind {
@@ -168,7 +179,7 @@ export function validateCompatibilityProfile(profile: CompatibilityProfile): voi
   }
   if (profile.endpoint_paths_by_wire_family) {
     for (const [wf, path] of Object.entries(profile.endpoint_paths_by_wire_family)) {
-      if (!isWireFamily(wf)) {
+      if (!isGenericWireFamily(wf)) {
         throw new GatewayError(
           "invalid_request",
           400,
@@ -233,7 +244,7 @@ export function validateCompatibilityProfile(profile: CompatibilityProfile): voi
           `model_wire_families[].pattern ${rule.pattern} is not a valid regular expression`,
         );
       }
-      if (!isWireFamily(rule.wire_family)) {
+      if (!isGenericWireFamily(rule.wire_family)) {
         throw new GatewayError(
           "invalid_request",
           400,
@@ -410,6 +421,7 @@ export interface ProviderAccountResponse {
   credentialKind: CredentialKind;
   credentialMode?: CredentialMode;
   tokenExpiresAt?: string;
+  jwtIssuer?: string;
   status: string;
   /** Live routing admission count for this request path; absent when unavailable. */
   inflight?: number;
@@ -668,6 +680,14 @@ export interface ProviderRoutingResponse {
   readonly creditLimitEnabled: boolean;
   /** Minimum remaining credits to keep globally; default 200. */
   readonly creditLimit: number;
+  /**
+   * Minimum remaining allowance an account must hold to stay routable; `null`
+   * means no floor. Unlike `creditLimit`, the floor can be expressed in percent,
+   * which is the only reading a utilization-only provider exposes.
+   */
+  readonly usageFloor: number | null;
+  /** Which reading `usageFloor` compares: absolute credit or percent. */
+  readonly usageFloorUnit: UsageFloorUnit;
   readonly enabled: boolean;
   /** When true, this provider's requests always dial direct. When false,
    * dispatch automatically picks the least-loaded, non-cooldown pool among

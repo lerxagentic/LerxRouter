@@ -42,6 +42,7 @@ import { providerCanConfigureUserAgent } from "../shared/provider-user-agent";
 import { RoutingStrategyCard } from "./provider-detail/RoutingStrategyCard";
 import { CredentialNotice } from "./provider-detail/CredentialNotice";
 import { AccountsList, AddAccountModal } from "./provider-detail/Accounts";
+import { UsageFloorControl } from "./provider-detail/UsageFloorControl";
 import { CreditPoolCard } from "./provider-detail/CreditPool";
 import { DeviceCodeDialog, OAuthBrowserDialog } from "./provider-detail/OAuthDialogs";
 import {
@@ -54,6 +55,7 @@ import { AddModelModal, ModelGrid, ThinkingSelect } from "./provider-detail/Mode
 import { freeAccessFromQuota } from "../shared/quota-formatters";
 import { useQuotaOverview } from "../hooks/quota";
 import { PROBE_REASONING_EFFORTS, type ProbeReasoningEffort } from "../data/contracts";
+import { InferhubMarketPanel } from "../components/InferhubMarketPanel";
 
 export default function ProviderDetail(): ReactNode {
   const { providerId } = useParams<{ providerId: string }>();
@@ -237,7 +239,16 @@ export default function ProviderDetail(): ReactNode {
     // `opener` is severed (noopener equivalent) while retaining the handle
     // needed to navigate/close the window; `window.open` with a literal
     // `noopener` feature would return null instead.
-    const blankPopup = window.open("about:blank", "cartethyia-oauth", "popup,width=720,height=820");
+    //
+    // Close any popup from a previous attempt first, and use a window name
+    // that is unique per attempt: a fixed name would make `window.open`
+    // *reuse* a still-open popup from an earlier login (for example the
+    // loopback success page, which never auto-closes), leaving the new flow
+    // navigating a stale window.
+    const previous = oauthPopupRef.current;
+    if (previous && !previous.closed) previous.close();
+    const windowName = `lerx-oauth-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const blankPopup = window.open("about:blank", windowName, "popup,width=720,height=820");
     if (blankPopup) {
       blankPopup.opener = null;
       oauthPopupRef.current = blankPopup;
@@ -251,7 +262,7 @@ export default function ProviderDetail(): ReactNode {
             blankPopup.location.href = authorizeUrl;
             target = blankPopup;
           } else {
-            target = window.open(authorizeUrl, "cartethyia-oauth", "popup,width=720,height=820");
+            target = window.open(authorizeUrl, windowName, "popup,width=720,height=820");
             if (target) {
               target.opener = null;
               oauthPopupRef.current = target;
@@ -358,6 +369,7 @@ export default function ProviderDetail(): ReactNode {
       />
       {/* Where to obtain this provider's credential */}
       <CredentialNotice provider={provider} />
+      {id === "inferhub" ? <InferhubMarketPanel /> : null}
       {/* Routing Strategy */}
       <RoutingStrategyCard
         providerId={id}
@@ -429,6 +441,7 @@ export default function ProviderDetail(): ReactNode {
           />
           <CardBody style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
             <CreditPoolCard providerId={id} accountCount={accounts.length} />
+            <UsageFloorControl providerId={id} />
             {accountsQuery.isPending ? (
               <LoadingState label="Loading accounts..." />
             ) : accountsQuery.isError ? (

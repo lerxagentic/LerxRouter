@@ -15,7 +15,7 @@ import { GatewayError, publicGatewayErrorBody } from "./transport/gateway-error"
 import { shutdownError, shutdownNotice } from "./transport/shutdown-notice";
 import type { CanonicalAdapter } from "./transport/middleware/request-context";
 import type { ApiKeyAuthorizationSnapshot } from "./security/api-key-auth";
-import { getPool } from "./persistence/postgres";
+import { getPool, getDb } from "./persistence/postgres";
 import { getRedisOrUndefined } from "./persistence/redis";
 import type { CartethyiaDatabase } from "./persistence/postgres";
 import type { ProviderAdapter } from "./providers/provider-registry";
@@ -25,6 +25,7 @@ import type { ByokUpstreamHost } from "./providers/operations/provider-catalog-s
 import type { NetworkPoolSelector } from "./network/pool/selector";
 import type { ProxyRequestPreparer } from "./transport/request/preparer";
 import { ProxyRequestStateStore } from "./transport/request/state";
+import type { RuntimeMetricsSampler } from "./observability/runtime-metrics";
 import { fastPathname } from "./transport/request/pathname";
 import {
   handleProviderProxyRequest,
@@ -34,9 +35,12 @@ import { createResponsesCompactHandler } from "./transport/dispatch/responses-co
 import { createSystemoneHandler } from "./transport/dispatch/systemone";
 import { createWebsearchHandler } from "./transport/dispatch/websearch";
 import { createImagesHandler } from "./transport/dispatch/images";
+import { createTokenCountHandler } from "./transport/dispatch/token-count";
 
 import { createTransportPipeline } from "./transport/middleware/pipeline";
 import { createDrainHandler } from "./transport/drain-endpoint";
+import { createConsoleAccountResetHandler } from "./console/auth/account-reset";
+import { resetConsoleAuthState } from "./console/auth/account-reset-store";
 import { PublicModelCatalogStore, type AllowedModelEntry } from "./console/providers/catalog/public-model-store";
 import type { IpAbuseProtectionService } from "./security/abuse";
 import type { ReadinessCheckResult } from "./persistence/readiness";
@@ -84,6 +88,7 @@ export interface GatewayShellDeps {
   readonly checkRedis?: () => Promise<void>;
   readonly readiness?: () => Promise<ReadinessCheckResult>;
   readonly shutdownCoordinator?: ShutdownCoordinatorLike;
+  readonly scheduledTasks?: ScheduledTaskRegistry;
 }
 
 /**
@@ -128,6 +133,7 @@ export interface ProductionAppDeps {
    */
   readonly scheduledTasks?: ScheduledTaskRegistry;
   readonly shutdownCoordinator: ShutdownCoordinatorLike;
+  readonly runtimeMetricsSampler?: RuntimeMetricsSampler;
   readonly dashboardDist?: string;
   readonly resolvePeerAddress?: (request: Request) => string | null;
   readonly maxBodyBytes?: number;
@@ -221,6 +227,9 @@ export function createGatewayApp(deps: GatewayAppDeps) {
 
   // Build the Elysia app with strict route ordering.
   const requestStateStore = new ProxyRequestStateStore(deps.shutdownCoordinator);
+  if (deps.mode === "production") {
+    deps.runtimeMetricsSampler?.bindInFlight(() => requestStateStore.activeCount());
+  }
   // Shutdown ordering: abort in-flight proxy controllers first so the
   // bounded drain observes cancellation and finalizers run before
   // telemetry flush and pool close. The reason is threaded through so the
@@ -237,7 +246,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
   const INFLIGHT_BACKSTOP_INTERVAL_MS = 30_000;
   const INFLIGHT_BACKSTOP_GRACE_MS = 30_000;
   const INFLIGHT_BACKSTOP_HARD_GRACE_MS = 120_000;
-  if (deps.mode === "production") deps.scheduledTasks?.register({
+  deps.scheduledTasks?.register({
     name: "inflight-backstop",
     intervalMs: INFLIGHT_BACKSTOP_INTERVAL_MS,
     run: () => {
@@ -343,6 +352,9 @@ export function createGatewayApp(deps: GatewayAppDeps) {
       trustedProxyBoundary: deps.trustedProxyBoundary,
       ...(deps.resolvePeerAddress ? { resolvePeerAddress: deps.resolvePeerAddress } : {}),
       ipAbuseProtection: deps.ipAbuseProtection,
+      ...(deps.runtimeMetricsSampler
+        ? { memorySnapshot: () => deps.runtimeMetricsSampler?.memorySnapshot() }
+        : {}),
       ...(deps.maxBodyBytes === undefined ? {} : { maxBodyBytes: deps.maxBodyBytes }),
       ...(deps.requestDeadlineMs === undefined ? {} : { requestDeadlineMs: deps.requestDeadlineMs }),
       ...(deps.verifiedHttps ? { verifiedHttps: true } : {}),
@@ -481,6 +493,19 @@ export function createGatewayApp(deps: GatewayAppDeps) {
       resolveOAuthRefresher: deps.resolveOAuthRefresher,
       oauthRefreshService: deps.oauthRefreshService,
     });
+    const handleTokenCount = createTokenCountHandler({
+      db: deps.db,
+      providerAdapters: deps.providerAdapters ?? new Map(),
+      resolveProviderAdapter: deps.resolveProviderAdapter,
+      proxyPreparer: deps.proxyPreparer,
+      stateStore: requestStateStore,
+      poolSelector: deps.poolSelector,
+      networkBindingFactory: deps.networkBindingFactory,
+      snapshotService: deps.snapshotService,
+      telemetryBuffer: deps.telemetryBuffer,
+      resolveOAuthRefresher: deps.resolveOAuthRefresher,
+      oauthRefreshService: deps.oauthRefreshService,
+    });
 
     // Gateway mounting: the pipeline owner composes stages, telemetry, and
     // cleanup; app only registers the public route table.
@@ -490,6 +515,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
         routes.post("/responses", proxyHandler);
         routes.post("/responses/compact", handleResponsesCompact);
         routes.post("/messages", proxyHandler);
+        routes.post("/messages/count_tokens", handleTokenCount);
         routes.post("/completions", proxyHandler);
         routes.post("/systemone", handleSystemone);
         routes.post("/search", handleWebsearch);
@@ -513,6 +539,17 @@ export function createGatewayApp(deps: GatewayAppDeps) {
         resolvePeerAddress: (request) => peerAddresses.get(request) ?? null,
       });
       app.post("/admin/drain", drainHandler);
+    }
+
+    if (deps.drainToken) {
+      app.post(
+        "/admin/reset-console-account",
+        createConsoleAccountResetHandler({
+          token: deps.drainToken,
+          resolvePeerAddress: (request) => peerAddresses.get(request) ?? null,
+          resetConsoleAccount: () => resetConsoleAuthState(getDb()),
+        }),
+      );
     }
 
     // `peerAddresses` is populated by the root `beforeHandle` above from

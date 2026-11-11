@@ -1,6 +1,9 @@
 import type { WireFamily } from "../transport/canonical-model";
 
-/** [OI]-compatible wire overrides persisted for bundled and BYOK providers. */
+import { QODER_CHAT_PATH, QODER_REALMS } from "./integrations/qoder/qoder-realm";
+import { TRAE_CHAT_PATH, TRAE_REALMS } from "./integrations/trae/trae-realm";
+
+/** OpenAI-compatible wire overrides persisted for bundled and BYOK providers. */
 export interface CompatibilityProfile {
   readonly extra_headers?: Readonly<Record<string, string>>;
   readonly extra_query_params?: Readonly<Record<string, string>>;
@@ -140,6 +143,12 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
   },
   { id: "hermes", displayName: "Nous Research", baseUrl: "https://inference-api.nousresearch.com/v1", credentialUrl: "https://portal.nousresearch.com" },
   { id: "bai", displayName: "B.AI", baseUrl: "https://api.b.ai/v1", credentialUrl: "https://b.ai" },
+  {
+    id: "inception",
+    displayName: "Inception Labs",
+    baseUrl: "https://api.inceptionlabs.ai/v1",
+    credentialUrl: "https://platform.inceptionlabs.ai/dashboard/api-keys",
+  },
   { id: "inferhub", displayName: "InferHub", baseUrl: "https://api.inferhub.dev/v1", defaultBypassProxy: true, hasAdapterUserAgent: true },
   { id: "aihubmix", displayName: "AiHubMix", baseUrl: "https://aihubmix.com/v1", credentialUrl: "https://aihubmix.com/token" },
   { id: "tokenharbor", displayName: "TokenHarbor", baseUrl: "https://tokenharbor.ai/v1", credentialUrl: "https://tokenharbor.ai" },
@@ -166,12 +175,29 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     // a custom User-Agent for it — the field would be silently ignored.
     id: "commandcode",
     displayName: "Command Code",
-    baseUrl: "https://api.commandcode.ai/alpha/generate",
+    baseUrl: "https://api.commandcode.ai/provider/v1",
     hasAdapterUserAgent: true,
     credentialUrl: "https://commandcode.ai/studio",
     credentialHint: "Use the API key from the Command Code CLI, or create one in the studio.",
   },
-  { id: "qoder", displayName: "Qoder", baseUrl: "https://api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1", hasAdapterUserAgent: true, credentialUrl: "https://qoder.com", credentialHint: "Signed in with a Qoder account; there is no key to paste." },
+  { id: "qoder", displayName: "Qoder", baseUrl: "https://api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1", hasAdapterUserAgent: true, credentialUrl: "https://qoder.com/account/integrations", credentialHint: "Paste a Personal Access Token (pt-...) from the Qoder integrations page, or sign in with your Qoder account." },
+  {
+    id: "qodercn",
+    displayName: "Qoder CN",
+    baseUrl: `${QODER_REALMS.cn.gateway}${QODER_CHAT_PATH}`,
+    hasAdapterUserAgent: true,
+    credentialUrl: `${QODER_REALMS.cn.website}/account/integrations`,
+    credentialHint: "Paste a Personal Access Token (pt-...) from the Qoder CN integrations page, or sign in with your Qoder China account.",
+  },
+  { id: "trae", displayName: "Trae", baseUrl: `${TRAE_REALMS.intl.core}${TRAE_CHAT_PATH}`, hasAdapterUserAgent: true, credentialUrl: "https://www.trae.ai/", credentialHint: "Paste a Trae account export (accessToken + refreshToken) or the raw access token from an international Trae account." },
+  {
+    id: "traecn",
+    displayName: "Trae CN",
+    baseUrl: `${TRAE_REALMS.cn.core}${TRAE_CHAT_PATH}`,
+    hasAdapterUserAgent: true,
+    credentialUrl: "https://www.trae.com.cn/",
+    credentialHint: "Paste a Trae CN account export (accessToken + refreshToken) or the raw access token from a Trae China account.",
+  },
   { id: "ollamacloud", displayName: "Ollama Cloud", baseUrl: "https://ollama.com/v1", credentialUrl: "https://ollama.com/settings/keys" },
   { id: "gemini", displayName: "Google Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", credentialUrl: "https://aistudio.google.com/app/apikey" },
   { id: "xiaomipg", displayName: "Xiaomi MiMo (PAYG)", baseUrl: "https://api.xiaomimimo.com/v1", credentialUrl: "https://platform.xiaomimimo.com" },
@@ -190,6 +216,30 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     credentialUrl: "https://github.com/settings/copilot",
   },
   { id: "perplexity", displayName: "Perplexity", baseUrl: "https://api.perplexity.ai", credentialUrl: "https://www.perplexity.ai/settings/api" },
+  {
+    id: "factory",
+    displayName: "Factory Droid",
+    baseUrl: "https://api.factory.ai",
+    credentialUrl: "https://app.factory.ai",
+  },
+  {
+    id: "cloudflareai",
+    displayName: "Cloudflare AI Gateway",
+    baseUrl: "https://gateway.ai.cloudflare.com",
+    credentialUrl: "https://dash.cloudflare.com/ai-gateway",
+  },
+  {
+    id: "dashscope",
+    displayName: "Alibaba DashScope",
+    baseUrl: "https://coding.dashscope.aliyuncs.com/v1",
+    credentialUrl: "https://bailian.console.aliyun.com/?apiKey=1",
+  },
+  {
+    id: "alibabacp",
+    displayName: "Alibaba Coding Plan",
+    baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+    credentialUrl: "https://bailian.console.aliyun.com/",
+  },
   // Web-search providers: their catalog carries a single `serviceKind:
   // "websearch"` model, served by the `/v1/search` native route rather than a
   // chat wire. `baseUrl` is the API origin the search spec builds requests from.

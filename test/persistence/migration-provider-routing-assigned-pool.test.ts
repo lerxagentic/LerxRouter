@@ -1,10 +1,16 @@
 import { expect, test } from "bun:test";
-import { dbDescribe, getTestPool } from "../helpers/database";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { dbDescribe, getTestPool, withRollback } from "../helpers/database";
 
 const MIGRATION_FILE = "0038_provider_routing_assigned_pool_id.sql";
 
+function migrationSql(): string {
+  return readFileSync(resolve(process.cwd(), "migrations", MIGRATION_FILE), "utf8");
+}
+
 dbDescribe("migration: provider routing assigned pool", () => {
-  test("adds the nullable pool reference and records the migration", async () => {
+  test("adds the nullable UUID pool reference, foreign key, and ledger entry", async () => {
     const pool = await getTestPool();
     const client = await pool.connect();
     try {
@@ -40,5 +46,23 @@ dbDescribe("migration: provider routing assigned pool", () => {
     } finally {
       client.release();
     }
+  });
+
+  test("is idempotent when applied to an existing routing table", async () => {
+    await withRollback(async (client) => {
+      await client.query(
+        'ALTER TABLE "provider_routing_settings" DROP COLUMN IF EXISTS "assigned_pool_id"',
+      );
+      await client.query(migrationSql());
+      await client.query(migrationSql());
+
+      const result = await client.query(
+        `select column_name from information_schema.columns
+          where table_schema = 'public'
+            and table_name = 'provider_routing_settings'
+            and column_name = 'assigned_pool_id'`,
+      );
+      expect(result.rows).toHaveLength(1);
+    });
   });
 });

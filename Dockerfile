@@ -5,7 +5,7 @@
 # `oven/bun:debian` and runtime with `debian:bookworm-slim`, then
 # replace apk/user commands with apt equivalents. Verify native modules and tools.
 
-FROM oven/bun:alpine AS builder
+FROM oven/bun:1.4.2-alpine AS builder
 
 WORKDIR /build
 
@@ -27,7 +27,30 @@ COPY scripts ./scripts
 COPY migrations ./migrations
 RUN bun run build:aot && bun run build:binary --outfile /build/dist/cartethyia
 
-# Runtime: only the binary, dashboard assets, migrations, and entrypoint ship.
+# OpenCode CLI is obtained from its official immutable release, pinned by
+# SHA-256 per target architecture. No private or third-party image is required.
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS opencode
+ARG TARGETARCH
+ARG BUILDARCH
+# Keep the release version in this step beside its per-architecture hashes;
+# changing it requires reviewing and updating both pinned checksums.
+RUN apk add --no-cache ca-certificates curl libgcc libstdc++ tar \
+    && set -eu \
+    && opencode_version="1.19.5" \
+    && case "$TARGETARCH" in \
+      arm64) asset="opencode-linux-arm64-musl.tar.gz"; sha="3522eccafd30d84a2d770b72a56d4877c576b9072b36a5a9ea0fa30ed82b896e" ;; \
+      amd64) asset="opencode-linux-x64-musl.tar.gz"; sha="e8d5be23bf8f3f69bc3206f3311215c049329cd6afa7c06d733987cc2d33b568" ;; \
+      *) echo "unsupported OpenCode target architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl --fail --location --silent --show-error --retry 3 \
+      "https://github.com/anomalyco/opencode/releases/download/v${opencode_version}/${asset}" \
+      --output /tmp/opencode.tar.gz \
+    && echo "${sha}  /tmp/opencode.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/opencode.tar.gz -C /usr/local/bin opencode \
+    && chmod 755 /usr/local/bin/opencode \
+    && if [ "$TARGETARCH" = "$BUILDARCH" ]; then /usr/local/bin/opencode --version; fi
+
+# Runtime ships the app binary, dashboard, migrations, OpenCode CLI, and license.
 FROM alpine:latest
 
 WORKDIR /app
@@ -43,6 +66,8 @@ COPY --from=builder --chown=cartethyia:cartethyia /build/migrations ./migrations
 COPY --from=builder --chown=cartethyia:cartethyia /build/dist/dashboard ./dist/dashboard
 COPY --chmod=755 docker-entrypoint.sh ./entrypoint.sh
 COPY --from=builder --chown=cartethyia:cartethyia /build/dist/cartethyia ./cartethyia
+COPY --from=opencode --chown=cartethyia:cartethyia /usr/local/bin/opencode /usr/local/bin/opencode
+COPY --chown=cartethyia:cartethyia third-party/opencode/LICENSE ./third-party/opencode/LICENSE
 
 ENV CARTETHYIA_VERSION=2.0 \
     NODE_ENV=production \

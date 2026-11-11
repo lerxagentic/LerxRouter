@@ -46,6 +46,14 @@ describe("buddy channel rejection 11128", () => {
     expect(c.retryAt!.getTime()).toBeGreaterThan(Date.now());
   });
 
+  test("does not park an account for a local or unscoped message collision", () => {
+    const c = classifyAccountError(new Error("Illegal API invocation from an unapproved channel"), {
+      providerId: "cb",
+      statusCode: 400,
+    });
+    expect(c.mutatesAccount).toBe(false);
+  });
+
   test("an upstream account suspension parks the account too", () => {
     // The buddy family reports a suspended account as "Request illegal:
     // Account Suspended." — a bare "Account Suspended" carries no provider
@@ -55,7 +63,8 @@ describe("buddy channel rejection 11128", () => {
       "Account Suspended",
     ]) {
       const c = classify(message, "", "cb");
-      expect(c.category).toBe("policy_blocked");
+      expect(c.category).toBe("policy_blocked_banned");
+      expect(c.status).toBe("disabled");
       expect(c.mutatesAccount).toBe(true);
     }
   });

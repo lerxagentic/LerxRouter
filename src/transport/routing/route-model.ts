@@ -1,6 +1,8 @@
 // Routing contracts and snapshots.
 import { GatewayError } from "../gateway-error";
 import { type ServiceKind, type WireFamily } from "../canonical-model";
+import type { ProviderQuotaWindow } from "../../providers/quota/quota-contracts";
+import { publishRoutingInvalidation, subscribeRoutingInvalidation } from "../../persistence/shared-cache";
 
 
 export type RoutingRevision = number;
@@ -26,12 +28,28 @@ export interface RouteCandidate {
   readonly provider_account_id?: string;
   /** Cooldown class: `hard` = excluded until the deadline; `soft` = deprioritized. */
   readonly cooldown_kind?: "hard" | "soft";
+  /** Absolute epoch-ms deadline for `cooldown_kind`, when the upstream stated one. */
+  readonly cooldown_until?: number;
+  /**
+   * Slow-lane stamp, applied at plan time from the live lane registry.
+   *
+   * A slow-lane account (Claude first-party OAuth whose usage limit the upstream
+   * moved to `slow`) still serves on spare capacity, so it is eligible and merely
+   * ordered behind fresh siblings. Read at plan time rather than baked into the
+   * snapshot because lane state changes per response.
+   */
+  readonly lane?: "slow";
   /** Global credit protection toggle for this candidate's provider/tenant. */
   readonly credit_limit_enabled?: boolean;
   /** Global minimum remaining credits; candidate excluded when balance ≤ it. */
   readonly credit_limit?: number;
   /** Last remaining credit the quota sweep fetched; absent = never fetched. */
   readonly last_remaining_credit?: number | null;
+  /** Minimum remaining allowance to stay routable; absent = no floor. */
+  readonly usage_floor?: number;
+  readonly usage_floor_unit?: "credit" | "percent";
+  /** Cached quota windows for this account, read per plan to evaluate the floor. */
+  readonly quota_windows?: readonly ProviderQuotaWindow[] | undefined;
   /** Operator-facing label of `provider_account_id` (never the secret), for
    * the Console Log detail line — logs must show a name, not a bare id. */
   readonly provider_account_label?: string;
@@ -62,6 +80,10 @@ export interface RouteCandidate {
    * Absent/`true` preserves the existing invariant: no account configured
    * means the route is unusable, not silently public. */
   readonly requires_account?: boolean;
+  /** True when the model is restricted to paid/pro tier accounts by the upstream. */
+  readonly pro_only?: boolean;
+  /** The plan reported by the account's quota read (e.g. "Free Plan Subscription"). */
+  readonly account_plan?: string | null;
 }
 
 /**
@@ -85,6 +107,10 @@ export interface ProviderRoutingSetting {
   readonly creditLimitEnabled?: boolean;
   /** Minimum remaining credits to keep on every account of this provider/tenant. */
   readonly creditLimit?: number;
+  /** Minimum remaining allowance to stay routable; `null`/absent = no floor. */
+  readonly usageFloor?: number | null;
+  /** Which reading `usageFloor` compares: absolute credit or percent. */
+  readonly usageFloorUnit?: "credit" | "percent";
   readonly enabled: boolean;
   /** Built-in API-key User-Agent; OAuth and custom providers retain their identities. */
   readonly userAgent?: string;
@@ -172,10 +198,13 @@ export interface RouteSnapshot {
   readonly providerRouting?: ProviderRoutingMap;
   /** Optional per-tenant pool selection strategy (absent = `least_loaded`). */
   readonly poolRouting?: Readonly<Record<string, PoolRoutingSetting>>;
+  /** Tenants whose invoke kill switch is active. */
+  readonly invokeDisabledTenants?: ReadonlySet<string>;
 }
 
 export type EligibilityReason =
   | "healthy"
+  | "slow"
   | "cooldown"
   | "cooldown_hard"
   | "credit_floor_reached"
@@ -188,6 +217,15 @@ export interface EligibilityDecision {
   readonly eligible: boolean;
   readonly reason: EligibilityReason;
   readonly candidate: RouteCandidate;
+  /**
+   * The instant this candidate recovers, when the exclusion is time-bounded.
+   *
+   * Optional by absence, not by value: `exactOptionalPropertyTypes` treats
+   * `cooldown_until: undefined` as a *present* property, which would assert a
+   * deadline exists for a candidate that has none. `plan()` reads the minimum
+   * across decisions to tell a client how long to wait.
+   */
+  readonly cooldown_until?: number;
 }
 
 export interface Reservation {
@@ -299,13 +337,31 @@ export function accountsUnavailableError(
 export function accountsRateLimitedError(
   requested: string,
   routed: string = requested,
+  /** Earliest epoch-ms instant any excluded candidate recovers, when known. */
+  earliestResetMs?: number,
 ): GatewayError {
   const routeNote = routed === requested ? "" : ` routed to '${routed}'`;
+  // The reset rides as `retryAfterMs`, the same hint every other retryable
+  // failure uses, so `error-lifecycle.ts` turns it into a real `retry-after`
+  // header instead of the one-second floor it falls back to for a bare 429.
+  // Reporting the actual earliest recovery is the difference between a client
+  // that waits out the window and one that re-dials a resting account every
+  // second. A value is only carried when a deadline was actually observed —
+  // inventing one would be a backoff nobody measured.
+  const retryAfterMs =
+    earliestResetMs !== undefined && earliestResetMs > Date.now()
+      ? earliestResetMs - Date.now()
+      : undefined;
   return new GatewayError(
     "accounts_rate_limited",
     429,
     `Model '${requested}'${routeNote} has no healthy account: every account is rate limited or cooling down`,
-    { model: requested, routed_model: routed, reason: "all_accounts_cooling" },
+    {
+      model: requested,
+      routed_model: routed,
+      reason: "all_accounts_cooling",
+      ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+    },
   );
 }
 
@@ -328,6 +384,7 @@ function deepFreeze<T>(obj: T): T {
 export class InMemoryRouteSnapshotService implements RouteSnapshotService {
   private revision: RoutingRevision = 0;
   private snapshot: RouteSnapshot | undefined;
+  readonly unsubscribe: () => void;
   /**
    * The in-flight build, tagged with the revision it is building.
    *
@@ -342,7 +399,12 @@ export class InMemoryRouteSnapshotService implements RouteSnapshotService {
    */
   private building: { revision: RoutingRevision; promise: Promise<RouteSnapshot> } | undefined;
 
-  constructor(private readonly builder: SnapshotBuilder) {}
+  constructor(private readonly builder: SnapshotBuilder) {
+    this.unsubscribe = subscribeRoutingInvalidation(() => {
+      this.revision += 1;
+      this.snapshot = undefined;
+    });
+  }
 
   async getSnapshot(): Promise<RouteSnapshot> {
     if (this.snapshot) return this.snapshot;
@@ -363,6 +425,7 @@ export class InMemoryRouteSnapshotService implements RouteSnapshotService {
   async invalidate(): Promise<RoutingRevision> {
     this.revision += 1;
     this.snapshot = undefined;
+    publishRoutingInvalidation();
     // Lazy: the next getSnapshot() rebuilds. Dashboard mutations only need
     // the new revision token — they must not pay seven Postgres round-trips
     // inside the mutating request while holding no pool pressure budget.

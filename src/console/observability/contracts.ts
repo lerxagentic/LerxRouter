@@ -136,6 +136,29 @@ export interface UsageCacheResponse {
   cacheWriteTokens: number;
   hitRate: number;
 }
+export interface UsageLatencyResponse {
+  readonly period: string;
+  readonly samples: number;
+  readonly ttft: {
+    readonly samples: number;
+    readonly p50: number | null;
+    readonly p95: number | null;
+  };
+  readonly total: {
+    readonly samples: number;
+    readonly p50: number | null;
+    readonly p95: number | null;
+  };
+  readonly byProvider: Record<
+    string,
+    {
+      readonly samples: number;
+      readonly totalP50: number | null;
+      readonly totalP95: number | null;
+      readonly ttftP50: number | null;
+    }
+  >;
+}
 export type UsageRequestMode = "stream" | "non_stream";
 export interface UsageRequestItem {
   requestId: string;
@@ -223,6 +246,8 @@ export interface TelemetryEventListPage {
 }
 export interface ObservabilityStore {
   health(tenantId: string): Promise<SystemHealthResponse>;
+  /** Uncached process memory for live alerting; never performs database I/O. */
+  liveMemory(): Promise<{ memory_bytes: number; memory_percent: number }>;
   usage(tenantId: string, period: string): Promise<UsageResponse>;
   listEvents(tenantId: string, limit: number, cursor?: string): Promise<TelemetryEventListPage>;
   getEvent(
@@ -246,6 +271,7 @@ export interface ObservabilityStore {
     httpStatus?: number,
   ): Promise<UsageRequestsResponse>;
   usageRequestDetail(tenantId: string, requestId: string): Promise<UsageRequestDetail | undefined>;
+  usageLatency(tenantId: string, period: string): Promise<UsageLatencyResponse>;
 }
 export interface ObservabilityConfig {
   readonly store: ObservabilityStore;
@@ -368,6 +394,13 @@ export function createObservabilityOperations(config: ObservabilityConfig) {
         parsedStatus,
       );
     },
+    async getUsageLatency(
+      access: AccessDecision | undefined,
+      period = "24h",
+    ): Promise<UsageLatencyResponse> {
+      const tenantId = operations.requireTenant(access);
+      return config.store.usageLatency(tenantId, operations.requirePeriod(period));
+    },
     async getUsageRequestDetail(
         access: AccessDecision | undefined,
         requestId: string,
@@ -443,6 +476,9 @@ export function createObservabilityRoutes(config: ObservabilityConfig): Elysia {
 })
     .get("/system/usage/requests/:requestId", async ({ request, params }) => {
       return await factory.getUsageRequestDetail(config.accessResolver(request), params.requestId);
+})
+    .get("/system/usage/latency", { query: usageQuery }, async ({ request, query }) => {
+      return await factory.getUsageLatency(config.accessResolver(request), query.period);
 })
     .get("/telemetry/events", { query: telemetryListQuery }, async ({ request, query }) => {
       return await factory.listEvents(

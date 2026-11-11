@@ -83,7 +83,7 @@ export const credentialKind = pgEnum("credential_kind", ["api_key", "oauth", "no
 
 // Shared wire-family domain used by providers.wire_family_default and
 // models.wire_family.
-export const wireFamily = pgEnum("wire_family", ["chat", "responses", "messages"]);
+export const wireFamily = pgEnum("wire_family", ["chat", "responses", "messages", "gemini"]);
 
 // `bridge` is a carte-bridge instance dialed as an application relay (or a
 // CONNECT tunnel where the runtime holds a socket) rather than an RFC proxy.
@@ -207,6 +207,11 @@ export const providerAccounts = pgTable("provider_accounts", {
    * been fetched.
    */
   lastRemainingCredit: numeric("last_remaining_credit", { precision: 16, scale: 4 }),
+  /**
+   * The plan reported by the last quota refresh (e.g. "Free Plan Subscription",
+   * "Pro"). Nullable. Used by the pro_only routing gate.
+   */
+  quotaPlan: text("quota_plan"),
 
   },
   (table) => [
@@ -290,6 +295,7 @@ export const models = pgTable(
     source: text("source"),
     sourceUpdatedAt: timestamp("source_updated_at", { withTimezone: true }),
     enabled: boolean("enabled").notNull().default(true),
+    proOnly: boolean("pro_only"),
   },
   (table) => [
     uniqueIndex("models_provider_model_route_uidx").on(
@@ -366,6 +372,15 @@ export const networkPools = pgTable("network_pools", {
   lastSpeedtestError: text("last_speedtest_error"),
   /** When the last speed-test ran. */
   lastSpeedtestAt: timestamp("last_speedtest_at", { withTimezone: true }),
+  providerProbeProviderId: text("provider_probe_provider_id"),
+  providerProbeStatus: text("provider_probe_status"),
+  providerProbeHttpStatus: integer("provider_probe_http_status"),
+  providerProbeReason: text("provider_probe_reason"),
+  providerProbeLatencyMs: integer("provider_probe_latency_ms"),
+  providerProbeAt: timestamp("provider_probe_at", { withTimezone: true }),
+  providerProbeEndpoint: text("provider_probe_endpoint"),
+  providerCooldowns: jsonb("provider_cooldowns")
+    .$type<Record<string, { until: number; reason: string; blocked?: boolean }>>(),
   /** Metered egress totals, flushed from the in-memory socket counters on
    * every pool-touching write so the quota bar survives a restart. */
   bytesSentTotal: bigint("bytes_sent_total", { mode: "number" }).notNull().default(0),
@@ -417,6 +432,7 @@ export const modelComboStrategy = pgEnum("model_combo_strategy", [
   "fallback",
   "round_robin",
   "fusion",
+  "smart",
 ]);
 
 /** Canonical `ComboStrategy` union, derived from the enum above. Console
@@ -483,6 +499,15 @@ export const providerRoutingSettings = pgTable(
     creditLimitEnabled: boolean("credit_limit_enabled").notNull().default(true),
     /** Minimum credits to keep unused on every account; default 200. */
     creditLimit: integer("credit_limit").notNull().default(200),
+    /**
+     * Minimum remaining allowance an account must hold to stay routable; `null`
+     * means no floor. Distinct from `creditLimit`, which is a fixed absolute
+     * threshold applied to every account: the floor can be expressed in percent,
+     * which is the only reading a utilization-only provider exposes.
+     */
+    usageFloor: integer("usage_floor"),
+    /** Which reading `usageFloor` compares: absolute credit or percent. */
+    usageFloorUnit: text("usage_floor_unit").$type<"credit" | "percent">().notNull().default("percent"),
     enabled: boolean("enabled").notNull().default(false),
     // Route-selected User-Agent for built-in API-key providers; OAuth and BYOK identities stay native.
     userAgent: text("user_agent").notNull().default("codex_cli_rs/0.156.1"),
@@ -588,6 +613,10 @@ export const apiKeys = pgTable(
     lifetimeTokensConsumed: bigint("lifetime_tokens_consumed", { mode: "number" })
       .notNull()
       .default(0),
+    /** Absolute expiry for this credential; null means it does not expire. */
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    /** Preset that provisioned this personal key; updates require explicit sync. */
+    modelTemplateId: uuid("model_template_id"),
     maxConcurrentRequests: integer("max_concurrent_requests"),
     /**
      * `whitelist` = only the names in `modelList` may be used (empty = all);
@@ -643,6 +672,22 @@ export const apiKeys = pgTable(
 );
 
 export type ApiKey = typeof apiKeys.$inferSelect;
+
+/** Tenant-owned named model whitelist presets. */
+export const modelTemplates = pgTable(
+  "model_templates",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: tenantRefRequired(),
+    name: text("name").notNull(),
+    modelList: jsonb("model_list").notNull().$type<readonly string[]>(),
+    createdAt: createdAtColumn(),
+  },
+  (table) => [
+    uniqueIndex("model_templates_tenant_name_uidx").on(table.tenantId, table.name),
+    index("model_templates_tenant_id_idx").on(table.tenantId),
+  ],
+);
 
 
 // Public bearer links for enrolling one shared key per resolved client IP, and
@@ -788,6 +833,14 @@ export const adminAuditLog = pgTable(
 // master toggle remains a typed column because it is read on the proxy path.
 export interface ConsoleSettingsPreferences {
   tenantConcurrencyLimit?: number | null;
+  /** Refuse all invoke traffic for this tenant while keeping Console reachable. */
+  invokeDisabled?: boolean;
+  /** Slack above configured concurrency limits; null uses no slack. */
+  concurrencyTolerance?: number | null;
+  /** Auto proxy for tests: connections without their own proxy borrow an active pool when tested. */
+  autoProxyForTests?: boolean;
+  /** Captured payload detail lifetime in minutes; null uses deployment default. */
+  telemetryWindowMinutes?: number | null;
   /** Normalizes provider-native thinking config for non-user final turns. */
   thinkingNormalizationEnabled?: boolean;
   responsesReasoningSummary?: "auto" | "concise" | "detailed";
@@ -822,6 +875,35 @@ export interface ConsoleSettingsPreferences {
    */
   activePersonaId?: string | null;
   /**
+   * Prompt Injections & Model Variants (9Router Pro parity):
+   * Global, per-API-key, per-model, and per-variant prompt injections (system & chat script modes).
+   */
+  promptInjections?: import("../transport/request/prompt-injection").PromptInjectionStoreData;
+  /**
+   * Outbound alert notifications configuration (Telegram & Webhook).
+   */
+  notifications?: import("../observability/notifier").NotificationSettings;
+  /**
+   * Database maintenance configuration (scheduled pruning & vacuum).
+   */
+  dbMaintenance?: {
+    readonly enabled?: boolean;
+    readonly retentionDays?: number;
+    readonly lastRunAt?: string | null;
+    readonly lastResult?: Record<string, unknown> | null;
+  };
+  /**
+   * Two-Factor Authentication (TOTP / 2FA) configuration.
+   */
+  totp?: {
+    readonly enabled?: boolean;
+    readonly secret?: string;
+    readonly backupHashes?: readonly string[];
+    readonly pendingSecret?: string;
+    readonly pendingBackupHashes?: readonly string[];
+    readonly createdAt?: string;
+  };
+  /**
    * Scheduled native backup delivered to a Telegram chat (mirrors 9Router's
    * auto-backup). `lastSentAt`/`lastError` are scheduler state, persisted so
    * a restart never re-sends a backup that already went out.
@@ -840,6 +922,22 @@ export interface ConsoleSettingsPreferences {
 export const consoleSettings = pgTable("console_settings", {
   tenantId: tenantRefPrimaryKey(),
   preferences: jsonb("preferences").notNull().default({}).$type<ConsoleSettingsPreferences>(),
+  updatedAt: updatedAtColumn(),
+});
+
+// InferHub `config_read` key. One row for the whole deployment.
+//
+// Deliberately NOT `provider_accounts.auth_state`: that field is documented as
+// per-account *non-secret* upstream config and travels with the account through
+// backup/restore, so a credential stored there is copied around and readable by
+// anything that reads accounts. This key is a secret and gets its own encrypted
+// row, unreachable from the account paths.
+export const inferhubConfigKeys = pgTable("inferhub_config_keys", {
+  id: text("id").primaryKey(),
+  /** `encryptCredential` output — never plaintext, never returned by an API. */
+  ciphertext: bytea("ciphertext").notNull(),
+  /** Hash only, for "did it change" checks. Not used to verify the key. */
+  fingerprint: text("fingerprint").notNull(),
   updatedAt: updatedAtColumn(),
 });
 
@@ -907,6 +1005,8 @@ export const telemetryEvents = pgTable(
     requestId: uuid("request_id").notNull(),
     sourceSurface: telemetrySourceSurface("source_surface"),
     requestedModel: text("requested_model"),
+    clientName: text("client_name"),
+    reportedModel: text("reported_model"),
     /** Canonical reasoning effort the client asked for; NULL when it asked for none. */
     requestedEffort: text("requested_effort"),
     providerId: text("provider_id"),
@@ -961,6 +1061,7 @@ export const telemetryEvents = pgTable(
     lastEventAtMs: bigint("last_event_at_ms", { mode: "number" }),
   },
   (table) => [
+    uniqueIndex("telemetry_events_tenant_request_uidx").on(table.tenantId, table.requestId),
     index("idx_telemetry_created_at").on(table.createdAt),
     index("telemetry_events_tenant_created_idx").on(table.tenantId, table.createdAt),
     index("telemetry_events_request_id_idx").on(table.requestId),
@@ -1104,3 +1205,63 @@ export const modelBenchmarks = pgTable(
   },
   (table) => [index("model_benchmarks_tenant_model_at_idx").on(table.tenantId, table.model, table.at)],
 );
+
+export const buddyUsageSnapshots = pgTable(
+  "buddy_usage_snapshots",
+  {
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => providerAccounts.id, { onDelete: "cascade" }),
+    dayKey: text("day_key").notNull(),
+    model: text("model").notNull(),
+    credit: numeric("credit", { precision: 14, scale: 4 }).notNull(),
+    syncedAt: timestamp("synced_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.accountId, table.dayKey, table.model] }),
+    index("buddy_usage_snapshots_day_idx").on(table.dayKey),
+  ],
+);
+
+export type BuddyUsageSnapshotRow = typeof buddyUsageSnapshots.$inferSelect;
+export type InsertBuddyUsageSnapshotRow = typeof buddyUsageSnapshots.$inferInsert;
+
+export const buddyTaskLedger = pgTable(
+  "buddy_task_ledger",
+  {
+    dayKey: text("day_key").notNull(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => providerAccounts.id, { onDelete: "cascade" }),
+    task: text("task").notNull(),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.dayKey, table.accountId, table.task] }),
+    index("buddy_task_ledger_account_idx").on(table.accountId),
+  ],
+);
+
+export type BuddyTaskLedgerRow = typeof buddyTaskLedger.$inferSelect;
+export type InsertBuddyTaskLedgerRow = typeof buddyTaskLedger.$inferInsert;
+
+export const telemetryReconciliationState = pgTable(
+  "telemetry_reconciliation_state",
+  {
+    jobName: text("job_name").primaryKey(),
+    leaseOwner: text("lease_owner"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    fileName: text("file_name").notNull().default(""),
+    byteOffset: bigint("byte_offset", { mode: "number" }).notNull().default(0),
+    filesCompleted: bigint("files_completed", { mode: "number" }).default(0),
+    eventsExamined: bigint("events_examined", { mode: "number" }).default(0),
+    eventsInserted: bigint("events_inserted", { mode: "number" }).default(0),
+    conflicts: bigint("conflicts", { mode: "number" }).default(0),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("telemetry_reconciliation_state_offset_nonneg", sql`${table.byteOffset} >= 0`),
+  ],
+);
+
+export type TelemetryReconciliationState = typeof telemetryReconciliationState.$inferSelect;

@@ -435,6 +435,13 @@ export class ProxyRequestPreparer {
         ? initialRequest
         : withThinkingSuffixIntent({ ...initialRequest, model: bareModel }, thinkingIntent);
     const snapshot = await this.deps.snapshotService.getSnapshot();
+    if (snapshot.invokeDisabledTenants?.has(authorization.tenantId)) {
+      throw new GatewayError(
+        "platform_unavailable",
+        503,
+        "This gateway has invoke switched off. Nothing upstream is being dialed while the switch is off; turn it back on from the dashboard overview to resume routing.",
+      );
+    }
     // Scope opts the key into the mapping table; the User-Agent decides whether
     // *this* request may consume it. Without the UA gate, a Claude→DeepSeek
     // remap would also rewrite a non-Claude caller that named `opus`.
@@ -783,6 +790,23 @@ export class ProxyRequestPreparer {
       ...(input.clientUserAgent === undefined ? {} : { clientUserAgent: input.clientUserAgent }),
       eligible: (candidate) => (candidate.service_kind ?? "llm") === input.serviceKind,
       emptyMessage: `no eligible route serves the '${input.serviceKind}' service for this model`,
+    });
+  }
+
+  async prepareNativeTokenCount(input: {
+    readonly model: string;
+    readonly authorization: ResolvedApiKey;
+    readonly signal?: AbortSignal;
+    readonly clientUserAgent?: string;
+  }): Promise<PreparedNativeRequest> {
+    return this.#planNative({
+      model: input.model,
+      authorization: input.authorization,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      ...(input.clientUserAgent === undefined ? {} : { clientUserAgent: input.clientUserAgent }),
+      eligible: (candidate) => candidate.wire_family === "messages",
+      emptyMessage:
+        "no eligible route can count tokens for this model — only an Anthropic Messages provider has /v1/messages/count_tokens",
     });
   }
 }

@@ -199,15 +199,14 @@ dbDescribe("streaming dispatch contract", () => {
       expect(lastFinishReason(frames)).toBe("error");
     });
 
-    test("a provider that produces nothing at all still answers the client", async () => {
-      // An empty event list means the adapter yielded no frames. The client
-      // must still get a well-formed, terminated stream rather than a socket
-      // that opens and closes with nothing on it.
+    test("an empty provider stream fails before response headers are committed", async () => {
+      // No upstream event arrived, so SSE headers have not been committed. The
+      // gateway can still return its structured 502 rather than a fake stream.
       gateway.adapter(world.providerId, { events: () => [] });
-      const { status, frames } = await streamChat();
-      expect(status).toBe(200);
-      expect(frames[frames.length - 1]).toBe("[DONE]");
-      expect(lastFinishReason(frames)).toBe("error");
+      const { status, frames, body } = await streamChat();
+      expect(status).toBe(502);
+      expect(frames).toEqual([]);
+      expect(body).toContain("transport_unavailable");
     });
   });
 

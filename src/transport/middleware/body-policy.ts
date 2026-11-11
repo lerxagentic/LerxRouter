@@ -16,13 +16,13 @@ function isProxyRequest(request: Request): boolean {
  * This list must mirror the routes `app.ts` actually mounts. It drives
  * body-read policy — a JSON route rejects a missing or non-JSON content-type
  * with 415, while an unrouted path is not read at all — so an entry with no
- * handler behind it describes a route the gateway does not serve. Three such
- * entries (`/v1/embeddings`, `/v1/images/generations`, `/v1/audio/speech`) sat
- * here with no adapter and no handler: they advertised a surface that 404s.
+ * handler behind it describes a route the gateway does not serve. Embeddings
+ * and audio speech remain absent; image generation is a mounted native service.
  *
- * The native service routes (`NATIVE_SERVICE_PATHS`, System One) are included:
- * they read a JSON body through the same policy, but their bodies are opaque
- * and are excluded from the canonical parse stage (see `request-context.ts`).
+ * The native service routes (`NATIVE_SERVICE_PATHS`: System One, websearch, and
+ * image generation) are included: they read a JSON body through the same policy,
+ * but their bodies are opaque and are excluded from the canonical parse stage
+ * (see `request-context.ts`).
  */
 const PROXY_JSON_ROUTES = [
   "/v1/chat/completions",
